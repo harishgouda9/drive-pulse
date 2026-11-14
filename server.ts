@@ -8,6 +8,11 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { DriveLruCache } from './src/core/lruCache';
 import { calculateThroughputMbps, computeFastChecksum } from './src/core/chunkStreamer';
 import { LiveSyncEvent, LiveSyncFilePayload } from './src/core/liveSyncEngine';
+import {
+  bumpPatchVersion,
+  SoftwareReleaseManifest,
+  UpdateChannel,
+} from './src/core/autoUpdateEngine';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +26,21 @@ const fileMetadataStore = new Map<
   string,
   { mimeType: string; folderPath: string; modifiedTime: string; source: 'live_drive' | 'sandbox' | 'harness_rpc' }
 >();
+
+let currentSoftwareRelease: SoftwareReleaseManifest = {
+  version: '2.5.0',
+  buildHash: 'build-250-ota-ready',
+  channel: 'stable',
+  publishedAt: new Date().toISOString(),
+  changelog: [
+    'Zero-downtime Over-The-Air (OTA) auto-updater for Desktop PWA & Connected Harness plugins',
+    'O(1) virtualized scrolling viewport & full-screen toggle for large files and image assets',
+    'Two-phase zero-blocking 16x worker Turbo Live Sync engine',
+  ],
+  critical: false,
+  autoApplyDelayMs: 1200,
+  targets: ['desktop_pwa', 'harness_plugin', 'mcp_agent', 'web_client'],
+};
 
 function broadcastLiveSyncEvent(
   partial: Omit<LiveSyncEvent, 'seq' | 'timestamp'>
@@ -74,13 +94,82 @@ async function startServer() {
     res.json({
       status: 'ok',
       bridge: 'drivepulse-harness-bridge',
+      version: currentSoftwareRelease.version,
+      buildHash: currentSoftwareRelease.buildHash,
+      release: currentSoftwareRelease,
       liveSyncSeq,
       activeSubscribers: sseSubscribers.size,
       cacheTelemetry: serverCache.getTelemetry(),
     });
   });
 
-  // Real-Time Server-Sent Events (SSE) Push Stream for Sub-Millisecond Google Drive <-> Harness Live Sync
+  // Authoritative OTA Version & Release Manifest Endpoint for Desktop & Connected Harness Polling
+  app.get('/api/system/version', (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.json({
+      release: currentSoftwareRelease,
+      liveSyncSeq,
+      activeSubscribers: sseSubscribers.size,
+      serverTime: new Date().toISOString(),
+    });
+  });
+
+  // Push a New Software Release Over-The-Air (OTA) to All Connected User Desktops & Harness Instances
+  app.post('/api/system/push-update', (req: Request, res: Response) => {
+    const start = performance.now();
+    const body = (req.body || {}) as {
+      version?: string;
+      bumpType?: 'patch' | 'minor';
+      channel?: UpdateChannel;
+      changelog?: string[];
+      critical?: boolean;
+      autoApplyDelayMs?: number;
+    };
+
+    const nextVersion =
+      body.version?.trim() ||
+      bumpPatchVersion(currentSoftwareRelease.version, body.bumpType || 'patch');
+    const nextBuildHash = `build-${nextVersion.replace(/\./g, '')}-${crypto
+      .randomBytes(3)
+      .toString('hex')}`;
+    const nextChannel: UpdateChannel = body.channel || currentSoftwareRelease.channel || 'stable';
+    const nextChangelog =
+      Array.isArray(body.changelog) && body.changelog.length > 0
+        ? body.changelog.map((c) => String(c))
+        : [
+            `Automated OTA hot-swap release v${nextVersion} (${nextBuildHash}) pushed to Desktop & Harness bridge`,
+            'Synchronized Service Worker asset cache & connected Harness plugin schema',
+          ];
+
+    currentSoftwareRelease = {
+      version: nextVersion,
+      buildHash: nextBuildHash,
+      channel: nextChannel,
+      publishedAt: new Date().toISOString(),
+      changelog: nextChangelog,
+      critical: Boolean(body.critical),
+      autoApplyDelayMs: typeof body.autoApplyDelayMs === 'number' ? body.autoApplyDelayMs : 1200,
+      targets: ['desktop_pwa', 'harness_plugin', 'mcp_agent', 'web_client'],
+    };
+
+    const latencyMs = Math.max(0.05, Math.round((performance.now() - start) * 100) / 100);
+    const event = broadcastLiveSyncEvent({
+      type: 'system:update_available',
+      latencyMs,
+      origin: 'SERVER_BUS',
+      release: currentSoftwareRelease,
+    });
+
+    res.json({
+      status: 'OTA_BROADCAST_SENT',
+      release: currentSoftwareRelease,
+      seq: event.seq,
+      notifiedSubscribers: sseSubscribers.size,
+      latencyMs,
+    });
+  });
+
+  // Real-Time Server-Sent Events (SSE) Push Stream for Sub-Millisecond Google Drive <-> Harness Live Sync & OTA Auto-Updates
   app.get('/api/sync/stream', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -96,6 +185,7 @@ async function startServer() {
       timestamp: new Date().toISOString(),
       latencyMs: 0.08,
       origin: 'SERVER_BUS',
+      release: currentSoftwareRelease,
       summary: {
         totalFiles: serverCache.entries().length,
         hydratedCount: serverCache.entries().length,
@@ -114,6 +204,7 @@ async function startServer() {
           timestamp: new Date().toISOString(),
           latencyMs: 0.05,
           origin: 'SERVER_BUS',
+          release: currentSoftwareRelease,
         };
         res.write(`data: ${JSON.stringify(hb)}\n\n`);
       } catch {
@@ -717,14 +808,18 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
       schemaVersion: '2.0',
       pluginId: 'drivepulse-harness-bridge',
       name: 'DrivePulse Google Drive Harness Plugin',
-      version: '2.4.0',
+      version: currentSoftwareRelease.version,
+      buildHash: currentSoftwareRelease.buildHash,
+      release: currentSoftwareRelease,
       description:
-        'Ultra-low-latency Google Drive data plane plugin with in-memory LRU caching, 64KB chunked streaming, real-time filename search, and bidirectional Web SDK / MCP JSON-RPC interfaces for Harness pipelines, AI agents, and host software.',
+        'Ultra-low-latency Google Drive data plane plugin with in-memory LRU caching, 64KB chunked streaming, real-time filename search, OTA auto-updates, and bidirectional Web SDK / MCP JSON-RPC interfaces for Harness pipelines, AI agents, and host software.',
       endpoints: {
         mcpRpc: `${origin}/api/mcp/rpc`,
         liveSyncStream: `${origin}/api/sync/stream`,
         turboBatchSync: `${origin}/api/sync/turbo-batch`,
         syncPing: `${origin}/api/sync/ping`,
+        systemVersion: `${origin}/api/system/version`,
+        pushUpdate: `${origin}/api/system/push-update`,
         importDriveLink: `${origin}/api/drive/import-link`,
         serviceAccountAuth: `${origin}/api/auth/service-account`,
         agentAnalyze: `${origin}/api/agent/analyze`,
@@ -733,6 +828,8 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
       transports: ['REST_MCP_JSON_RPC', 'WEB_SDK_POSTMESSAGE', 'SSE_REALTIME_STREAM'],
       supportedMethods: [
         'plugin.handshake',
+        'plugin.checkUpdate',
+        'plugin.pushUpdate',
         'drive.list',
         'drive.search',
         'drive.read',
@@ -768,7 +865,7 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
     }
 
     try {
-      if (method === 'plugin.handshake') {
+      if (method === 'plugin.handshake' || method === 'plugin.checkUpdate') {
         const entries = serverCache.entries();
         const latencyMs = Math.round((performance.now() - start) * 100) / 100;
         res.json({
@@ -776,21 +873,71 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
           id,
           result: {
             pluginId: 'drivepulse-harness-bridge',
-            version: '2.4.0',
+            version: currentSoftwareRelease.version,
+            buildHash: currentSoftwareRelease.buildHash,
+            release: currentSoftwareRelease,
             status: 'READY',
             mountedFileCount: entries.length,
             supportedMethods: [
               'plugin.handshake',
+              'plugin.checkUpdate',
+              'plugin.pushUpdate',
               'drive.list',
               'drive.search',
               'drive.read',
               'drive.upload',
               'drive.delete',
               'drive.deltaSync',
+              'drive.turboSync',
             ],
             cacheTelemetry: serverCache.getTelemetry(),
             latencyMs,
             cacheStatus: 'HIT',
+          },
+        });
+        return;
+      }
+
+      if (method === 'plugin.pushUpdate') {
+        const nextVersion =
+          typeof params.version === 'string' && params.version.trim()
+            ? params.version.trim()
+            : bumpPatchVersion(currentSoftwareRelease.version, 'patch');
+        const nextBuildHash = `build-${nextVersion.replace(/\./g, '')}-${crypto
+          .randomBytes(3)
+          .toString('hex')}`;
+        const nextChangelog = Array.isArray(params.changelog)
+          ? params.changelog.map((c) => String(c))
+          : [
+              `Harness RPC triggered OTA release v${nextVersion} (${nextBuildHash})`,
+              'Auto-updated desktop client and connected Harness plugin runtime',
+            ];
+        currentSoftwareRelease = {
+          version: nextVersion,
+          buildHash: nextBuildHash,
+          channel: (params.channel as UpdateChannel) || currentSoftwareRelease.channel,
+          publishedAt: new Date().toISOString(),
+          changelog: nextChangelog,
+          critical: Boolean(params.critical),
+          autoApplyDelayMs: 1000,
+          targets: ['desktop_pwa', 'harness_plugin', 'mcp_agent', 'web_client'],
+        };
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+        const ev = broadcastLiveSyncEvent({
+          type: 'system:update_available',
+          latencyMs,
+          origin: 'HARNESS_RPC',
+          release: currentSoftwareRelease,
+        });
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            status: 'OTA_BROADCAST_SENT',
+            release: currentSoftwareRelease,
+            seq: ev.seq,
+            notifiedSubscribers: sseSubscribers.size,
+            latencyMs,
           },
         });
         return;

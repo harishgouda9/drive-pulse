@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "DrivePulse Harness Bridge",
+  "short_name": "DrivePulse",
+  "description": "Ultra-fast Google Drive synchronization plugin and auto-updating low-latency data bridge for desktop and software harnesses.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0B0F19",
+  "theme_color": "#2563EB",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

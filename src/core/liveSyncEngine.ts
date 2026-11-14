@@ -1,11 +1,13 @@
 import { CacheEntry, CacheStatus, DriveItem } from '../types/drive';
+import { SoftwareReleaseManifest } from './autoUpdateEngine';
 
 export type LiveSyncEventType =
   | 'sync:init'
   | 'file:upserted'
   | 'file:deleted'
   | 'sync:turbo_complete'
-  | 'sync:heartbeat';
+  | 'sync:heartbeat'
+  | 'system:update_available';
 
 export interface LiveSyncFilePayload {
   fileId: string;
@@ -27,6 +29,7 @@ export interface LiveSyncEvent {
   origin: 'HARNESS_RPC' | 'GOOGLE_DRIVE_DELTA' | 'TURBO_BATCH' | 'SERVER_BUS';
   file?: LiveSyncFilePayload;
   deletedFileId?: string;
+  release?: SoftwareReleaseManifest;
   summary?: {
     totalFiles: number;
     hydratedCount: number;

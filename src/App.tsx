@@ -53,7 +53,8 @@ import { AgentStudioView } from './components/AgentStudioView';
 import { HarnessSdkView, PluginRpcMethod } from './components/HarnessSdkView';
 import { UploadModal } from './components/UploadModal';
 import { DestructiveConfirmModal } from './components/DestructiveConfirmModal';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsModal, SettingsTabId } from './components/SettingsModal';
+import { useAutoUpdater } from './hooks/useAutoUpdater';
 
 export default function App() {
   const lruCacheRef = useRef<DriveLruCache>(new DriveLruCache(128 * 1024 * 1024));
@@ -73,6 +74,7 @@ export default function App() {
   // Plugin Settings State
   const [settings, setSettings] = useState<PluginSettings>(DEFAULT_PLUGIN_SETTINGS);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabId>('auth');
 
   // Auth State (following workspace-integration pattern + multi-channel recovery)
   const [needsAuth, setNeedsAuth] = useState<boolean>(true);
@@ -86,6 +88,19 @@ export default function App() {
     null
   );
   const [lastTransferBanner, setLastTransferBanner] = useState<string | null>(null);
+
+  // Autonomous Over-The-Air (OTA) Desktop & Connected Harness Auto-Updater
+  const autoUpdater = useAutoUpdater({
+    autoUpdateEnabled: settings.autoUpdateEnabled,
+    autoUpdateHarnessPlugin: settings.autoUpdateHarnessPlugin,
+    channel: settings.autoUpdateChannel,
+    checkIntervalSec: settings.autoUpdateCheckIntervalSec,
+    onUpdateApplied: (entry) => {
+      setLastTransferBanner(
+        `Auto-Updated Desktop & Connected Harness from v${entry.fromVersion} to v${entry.toVersion} (${entry.buildHash}) — ${entry.changelog[0] || 'OTA release applied'}`
+      );
+    },
+  });
 
   // Real-Time Sync, Transfer Job Logs & Recorded Latency Events (Zero Fake/Demo Data)
   const [startPageToken, setStartPageToken] = useState<string>('1');
@@ -208,6 +223,10 @@ export default function App() {
             setLiveSyncSeq(event.seq);
           }
 
+          if (event.release) {
+            void autoUpdater.ingestRemoteRelease(event.release);
+          }
+
           if (event.type === 'sync:heartbeat') {
             return;
           }
@@ -218,6 +237,11 @@ export default function App() {
             }
             return [event, ...prev].slice(0, 40);
           });
+
+          if (event.type === 'system:update_available' && event.release) {
+            recordLatencyEvent('LRU_READ', event.latencyMs, 0);
+            return;
+          }
 
           if (event.type === 'file:upserted' && event.file) {
             const f = event.file;
@@ -270,7 +294,7 @@ export default function App() {
       }
       es?.close();
     };
-  }, [recordLatencyEvent]);
+  }, [autoUpdater.ingestRemoteRelease, recordLatencyEvent]);
 
   // Select & Hydrate File via LRU Cache or Real Stream (0ms Optimistic UI Selection + Binary Media Support)
   const handleSelectAndHydrateFile = useCallback(
@@ -419,13 +443,18 @@ export default function App() {
           id,
           result: {
             pluginId: 'io.drivepulse.harness.bridge',
-            version: '2.4.0',
+            version: autoUpdater.currentVersion,
+            buildHash: autoUpdater.currentBuildHash,
+            autoUpdateEnabled: settings.autoUpdateEnabled,
+            autoUpdateHarnessPlugin: settings.autoUpdateHarnessPlugin,
             status: 'READY',
             hostApp: String(params.hostApp || 'external-host'),
             authenticatedUser: user?.email || null,
             cachedItemsCount: items.length,
             supportedMethods: [
               'plugin.handshake',
+              'plugin.checkUpdate',
+              'plugin.pushUpdate',
               'drive.list',
               'drive.search',
               'drive.read',
@@ -1309,6 +1338,13 @@ export default function App() {
       Number(resData?.result?.byteSize || 0)
     );
 
+    if (
+      (method === 'plugin.pushUpdate' || method === 'plugin.checkUpdate') &&
+      resData?.result?.release
+    ) {
+      void autoUpdater.ingestRemoteRelease(resData.result.release);
+    }
+
     if (method === 'drive.upload' && resData?.result?.fileId) {
       const uploadedItem: DriveItem = {
         id: String(resData.result.fileId),
@@ -1373,6 +1409,19 @@ export default function App() {
         isLoggingIn={isLoggingIn}
         onGoogleLogin={handleGoogleLogin}
         onLogout={handleLogout}
+        currentVersion={autoUpdater.currentVersion}
+        autoUpdateEnabled={settings.autoUpdateEnabled}
+        updateStatus={autoUpdater.status}
+        pendingRelease={autoUpdater.pendingRelease}
+        onOpenAutoUpdateCenter={() => {
+          setSettingsInitialTab('updates');
+          setIsSettingsOpen(true);
+        }}
+        onApplyPendingUpdate={() => {
+          if (autoUpdater.pendingRelease) {
+            autoUpdater.applyReleaseNow(autoUpdater.pendingRelease, 'MANUAL_TRIGGER');
+          }
+        }}
       />
 
       {/* Compact Host Plugin Mode Banner when ?embed=plugin is active */}
@@ -1544,9 +1593,10 @@ export default function App() {
         onCancel={() => setDestructiveRequest(null)}
       />
 
-      {/* Comprehensive Plugin Settings & Google OAuth Control Center Modal */}
+      {/* Comprehensive Plugin Settings, Auto-Update OTA & Google OAuth Control Center Modal */}
       <SettingsModal
         isOpen={isSettingsOpen}
+        initialTab={settingsInitialTab}
         settings={settings}
         onUpdateSettings={handleUpdateSettings}
         user={user}
@@ -1566,6 +1616,17 @@ export default function App() {
           setCacheVersion((v) => v + 1);
         }}
         onLogout={handleLogout}
+        currentVersion={autoUpdater.currentVersion}
+        currentBuildHash={autoUpdater.currentBuildHash}
+        updateStatus={autoUpdater.status}
+        lastUpdateCheckAt={autoUpdater.lastCheckedAt}
+        updateHistory={autoUpdater.updateHistory}
+        swRegistered={autoUpdater.swRegistered}
+        isDesktopInstallable={autoUpdater.isDesktopInstallable}
+        isDesktopInstalled={autoUpdater.isDesktopInstalled}
+        onInstallDesktopApp={autoUpdater.installDesktopApp}
+        onCheckForUpdatesNow={autoUpdater.checkForUpdatesNow}
+        onPushSoftwareUpdateOta={autoUpdater.pushSoftwareUpdateOta}
       />
     </div>
   );

@@ -1,4 +1,5 @@
 import firebaseConfig from '../../firebase-applet-config.json';
+import { UpdateChannel } from '../core/autoUpdateEngine';
 
 export type AuthChannelMode =
   | 'GIS_DIRECT'
@@ -27,6 +28,10 @@ export interface PluginSettings {
   pageSize: 15 | 30 | 50 | 100;
   defaultFolderPath: string;
   requireDestructiveConfirm: boolean;
+  autoUpdateEnabled: boolean;
+  autoUpdateHarnessPlugin: boolean;
+  autoUpdateChannel: UpdateChannel;
+  autoUpdateCheckIntervalSec: 15 | 30 | 60;
 }
 
 export const DEFAULT_PLUGIN_SETTINGS: PluginSettings = {
@@ -43,4 +48,8 @@ export const DEFAULT_PLUGIN_SETTINGS: PluginSettings = {
   pageSize: 30,
   defaultFolderPath: '/Google Drive',
   requireDestructiveConfirm: true,
+  autoUpdateEnabled: true,
+  autoUpdateHarnessPlugin: true,
+  autoUpdateChannel: 'stable',
+  autoUpdateCheckIntervalSec: 15,
 };

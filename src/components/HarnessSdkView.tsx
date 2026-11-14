@@ -4,6 +4,8 @@ import { DriveItem, HarnessRpcLog } from '../types/drive';
 
 export type PluginRpcMethod =
   | 'plugin.handshake'
+  | 'plugin.checkUpdate'
+  | 'plugin.pushUpdate'
   | 'drive.list'
   | 'drive.search'
   | 'drive.read'
@@ -67,6 +69,11 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
           }
         : method === 'drive.deltaSync'
         ? { pageToken: '1' }
+        : method === 'plugin.pushUpdate'
+        ? {
+            channel: 'stable',
+            changelog: ['Triggered OTA hot-update from Harness SDK RPC Console'],
+          }
         : {};
 
     setSelectedLogId(null);
@@ -80,6 +87,8 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
       ? { query: searchQueryParam.trim() || 'spec', scope: 'filename' }
       : method === 'drive.deltaSync'
       ? { pageToken: '1' }
+      : method === 'plugin.pushUpdate'
+      ? { channel: 'stable', changelog: ['Automated Harness CI/CD OTA release'] }
       : {};
 
   const originUrl = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
@@ -117,10 +126,14 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
 ></iframe>
 
 <script>
-  // 2. Listen for 1-Click "Emit to Host Plugin" file events or RPC responses
+  // 2. Listen for 1-Click "Emit to Host Plugin" file events, RPC responses, and autonomous OTA updates
   window.addEventListener('message', (event) => {
     if (event.data?.source === 'drivepulse-plugin-bridge') {
-      console.log('Received Google Drive file from DrivePulse Plugin:', event.data);
+      if (event.data.method === 'plugin.autoUpdate') {
+        console.log('DrivePulse Plugin Auto-Updated to v' + event.data.params.version, event.data.params);
+      } else {
+        console.log('Received Google Drive payload from DrivePulse Plugin:', event.data);
+      }
     }
   });
 
@@ -141,10 +154,15 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
       "url": "${originUrl}/api/mcp/rpc",
       "liveSyncStreamUrl": "${originUrl}/api/sync/stream",
       "turboBatchUrl": "${originUrl}/api/sync/turbo-batch",
+      "systemVersionUrl": "${originUrl}/api/system/version",
+      "pushUpdateUrl": "${originUrl}/api/system/push-update",
       "manifestUrl": "${originUrl}/api/plugin/manifest.json",
       "transport": "http-jsonrpc+sse",
+      "autoUpdate": true,
       "capabilities": [
         "plugin.handshake",
+        "plugin.checkUpdate",
+        "plugin.pushUpdate",
         "drive.list",
         "drive.search",
         "drive.read",
@@ -173,7 +191,7 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
               <span>Harness & External Software Plugin SDK + MCP Bridge</span>
             </h1>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Embed DrivePulse directly as a plugin inside Harness CI/CD, IDP portals, Cursor/Claude MCP agents, or any host software via Web SDK PostMessage and HTTP JSON-RPC.
+              Embed DrivePulse directly as an auto-updating plugin inside Harness CI/CD, IDP portals, Cursor/Claude MCP agents, or any host software via Web SDK PostMessage and HTTP JSON-RPC.
             </p>
           </div>
 
@@ -245,6 +263,8 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
               className="w-full px-3 py-2 text-xs font-mono bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
             >
               <option value="plugin.handshake">plugin.handshake (Verify Plugin Status)</option>
+              <option value="plugin.checkUpdate">plugin.checkUpdate (Check OTA Release)</option>
+              <option value="plugin.pushUpdate">plugin.pushUpdate (Push Auto-Update to Desktop & Harness)</option>
               <option value="drive.turboSync">drive.turboSync (Ultra-Fast Parallel Sync)</option>
               <option value="drive.search">drive.search (Instant Filename Search)</option>
               <option value="drive.list">drive.list (List Mounted Metadata)</option>

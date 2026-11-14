@@ -1,11 +1,13 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   Check,
   Cpu,
+  Download,
   ExternalLink,
   KeyRound,
   RefreshCw,
+  Rocket,
   Settings,
   ShieldCheck,
   Sliders,
@@ -19,8 +21,14 @@ import {
   DriveScopeOption,
   PluginSettings,
 } from '../types/settings';
+import {
+  AutoUpdateHistoryEntry,
+  SoftwareReleaseManifest,
+  UpdateChannel,
+} from '../core/autoUpdateEngine';
+import { AutoUpdaterStatus } from '../hooks/useAutoUpdater';
 
-export type SettingsTabId = 'auth' | 'tokens' | 'engine' | 'bridge';
+export type SettingsTabId = 'auth' | 'tokens' | 'engine' | 'bridge' | 'updates';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -44,6 +52,23 @@ interface SettingsModalProps {
   }) => Promise<void>;
   onPurgeCache: () => void;
   onLogout: () => void;
+  currentVersion?: string;
+  currentBuildHash?: string;
+  updateStatus?: AutoUpdaterStatus;
+  lastUpdateCheckAt?: string;
+  updateHistory?: AutoUpdateHistoryEntry[];
+  swRegistered?: boolean;
+  isDesktopInstallable?: boolean;
+  isDesktopInstalled?: boolean;
+  onInstallDesktopApp?: () => Promise<boolean>;
+  onCheckForUpdatesNow?: () => Promise<SoftwareReleaseManifest | null>;
+  onPushSoftwareUpdateOta?: (params?: {
+    version?: string;
+    bumpType?: 'patch' | 'minor';
+    channel?: UpdateChannel;
+    changelog?: string[];
+    critical?: boolean;
+  }) => Promise<SoftwareReleaseManifest>;
 }
 
 const GCP_PROJECT_ID = 'gen-lang-client-0526103837';
@@ -70,6 +95,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSubmitRefreshToken,
   onPurgeCache,
   onLogout,
+  currentVersion = '2.5.0',
+  currentBuildHash = 'build-250-ota-ready',
+  updateStatus = 'UP_TO_DATE',
+  lastUpdateCheckAt = 'Just now',
+  updateHistory = [],
+  swRegistered = true,
+  isDesktopInstallable = false,
+  isDesktopInstalled = false,
+  onInstallDesktopApp,
+  onCheckForUpdatesNow,
+  onPushSoftwareUpdateOta,
 }) => {
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [directToken, setDirectToken] = useState('');
@@ -79,6 +115,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [refreshTokenValue, setRefreshTokenValue] = useState('');
   const [localError, setLocalError] = useState<string | null>(null);
   const [statusToast, setStatusToast] = useState<string | null>(null);
+
+  // OTA Release Push Form State
+  const [otaBumpType, setOtaBumpType] = useState<'patch' | 'minor'>('patch');
+  const [otaReleaseNote, setOtaReleaseNote] = useState(
+    'Hot-swapped Google Drive virtualized stream viewer and Harness MCP bridge schema'
+  );
+  const [isPushingOta, setIsPushingOta] = useState(false);
+
+  useEffect(() => {
+    if (isOpen && initialTab) {
+      setActiveTab(initialTab);
+    }
+  }, [isOpen, initialTab]);
 
   if (!isOpen) return null;
 
@@ -167,6 +216,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       id: 'bridge',
       label: 'Workspace & Harness',
       icon: <Cpu className="w-3.5 h-3.5" />,
+    },
+    {
+      id: 'updates',
+      label: 'Auto-Update & OTA',
+      icon: <Rocket className="w-3.5 h-3.5" />,
     },
   ];
 
@@ -843,6 +897,301 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </button>
                   )}
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 5: AUTONOMOUS DESKTOP & CONNECTED HARNESS OTA AUTO-UPDATER */}
+          {activeTab === 'updates' && (
+            <div className="space-y-4">
+              {/* Live Runtime Version & Zero-Touch Auto-Update Status Banner */}
+              <div className="p-4 bg-blue-50/70 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/80 rounded-xl flex flex-wrap items-center justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="font-bold text-slate-900 dark:text-slate-100">
+                      Active Build: v{currentVersion} ({currentBuildHash})
+                    </span>
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-blue-600 text-white font-semibold uppercase">
+                      {settings.autoUpdateChannel}
+                    </span>
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-600 dark:text-slate-400">
+                    <span>Status: {updateStatus}</span>
+                    <span aria-hidden="true" className="mx-1.5">·</span>
+                    <span>Last Checked: {lastUpdateCheckAt}</span>
+                    <span aria-hidden="true" className="mx-1.5">·</span>
+                    <span>
+                      Desktop Service Worker: {swRegistered ? 'Active (SkipWaiting)' : 'Standby'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {isDesktopInstallable && !isDesktopInstalled && onInstallDesktopApp && (
+                    <button
+                      type="button"
+                      onClick={() => void onInstallDesktopApp()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Install Desktop App</span>
+                    </button>
+                  )}
+                  {onCheckForUpdatesNow && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const rel = await onCheckForUpdatesNow();
+                        showToast(
+                          rel
+                            ? `Verified server release v${rel.version} (${rel.buildHash}).`
+                            : 'Checked OTA update server.'
+                        );
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 dark:text-slate-100 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 rounded-lg cursor-pointer"
+                    >
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${
+                          updateStatus === 'CHECKING' ? 'animate-spin' : ''
+                        }`}
+                      />
+                      <span>Check for Updates Now</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Autonomous Auto-Update Policy Controls */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="p-4 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label
+                      htmlFor="toggle-desktop-autoupdate"
+                      className="font-bold text-slate-900 dark:text-slate-100"
+                    >
+                      Auto-Update User Desktop &amp; Web Runtime
+                    </label>
+                    <input
+                      id="toggle-desktop-autoupdate"
+                      type="checkbox"
+                      checked={settings.autoUpdateEnabled}
+                      onChange={(e) => {
+                        onUpdateSettings({ autoUpdateEnabled: e.target.checked });
+                        showToast(
+                          e.target.checked
+                            ? 'Enabled autonomous zero-touch Desktop OTA updates.'
+                            : 'Switched Desktop updates to manual confirmation.'
+                        );
+                      }}
+                      className="w-4 h-4 accent-blue-600 cursor-pointer"
+                    />
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    When enabled, pushed updates automatically hot-swap the Service Worker asset cache and runtime in user desktop instances without manual intervention.
+                  </p>
+                </div>
+
+                <div className="p-4 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label
+                      htmlFor="toggle-harness-autoupdate"
+                      className="font-bold text-slate-900 dark:text-slate-100"
+                    >
+                      Auto-Update Connected Harness &amp; Host Software
+                    </label>
+                    <input
+                      id="toggle-harness-autoupdate"
+                      type="checkbox"
+                      checked={settings.autoUpdateHarnessPlugin}
+                      onChange={(e) => {
+                        onUpdateSettings({ autoUpdateHarnessPlugin: e.target.checked });
+                        showToast(
+                          e.target.checked
+                            ? 'Enabled autonomous Harness Plugin hot-update notifications.'
+                            : 'Paused Harness Plugin auto-update broadcast.'
+                        );
+                      }}
+                      className="w-4 h-4 accent-blue-600 cursor-pointer"
+                    />
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Automatically emits <code className="font-mono">plugin.autoUpdate</code> JSON-RPC frames over <code className="font-mono">window.parent.postMessage</code> and SSE to connected Harness hosts.
+                  </p>
+                </div>
+
+                <div className="p-4 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
+                  <label
+                    htmlFor="settings-update-channel"
+                    className="block font-bold text-slate-900 dark:text-slate-100"
+                  >
+                    OTA Release Channel
+                  </label>
+                  <select
+                    id="settings-update-channel"
+                    value={settings.autoUpdateChannel}
+                    onChange={(e) => {
+                      const ch = e.target.value as UpdateChannel;
+                      onUpdateSettings({ autoUpdateChannel: ch });
+                      showToast(`Switched OTA release channel to ${ch.toUpperCase()}.`);
+                    }}
+                    className="w-full px-3 py-2 font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                  >
+                    <option value="stable">Stable (Production Desktop &amp; Harness)</option>
+                    <option value="rapid">Rapid (Continuous Hot-Swap)</option>
+                    <option value="canary">Canary (Bleeding-Edge Builds)</option>
+                  </select>
+                </div>
+
+                <div className="p-4 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
+                  <label
+                    htmlFor="settings-update-interval"
+                    className="block font-bold text-slate-900 dark:text-slate-100"
+                  >
+                    Background Version Drift Poll (Plus Instant SSE Push)
+                  </label>
+                  <select
+                    id="settings-update-interval"
+                    value={settings.autoUpdateCheckIntervalSec}
+                    onChange={(e) => {
+                      const sec = Number(
+                        e.target.value
+                      ) as PluginSettings['autoUpdateCheckIntervalSec'];
+                      onUpdateSettings({ autoUpdateCheckIntervalSec: sec });
+                      showToast(`Updated background OTA version check interval to ${sec}s.`);
+                    }}
+                    className="w-full px-3 py-2 font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                  >
+                    <option value={15}>Every 15 Seconds + Real-Time SSE Stream</option>
+                    <option value={30}>Every 30 Seconds + Real-Time SSE Stream</option>
+                    <option value={60}>Every 60 Seconds + Real-Time SSE Stream</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Live OTA Release Publisher (Push Update to Desktop & Connected Harness) */}
+              {onPushSoftwareUpdateOta && (
+                <div className="p-4 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-xl space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                        <Rocket className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                        <span>Push Live Software Update (Broadcast to User Desktops &amp; Connected Harness)</span>
+                      </div>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                        Publishes a new build over <code className="font-mono">/api/system/push-update</code> and <code className="font-mono">/api/sync/stream</code> so all connected desktops and Harness plugins auto-update on their own.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label
+                        htmlFor="ota-bump-select"
+                        className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                      >
+                        Version Increment
+                      </label>
+                      <select
+                        id="ota-bump-select"
+                        value={otaBumpType}
+                        onChange={(e) => setOtaBumpType(e.target.value as 'patch' | 'minor')}
+                        className="w-full px-3 py-2 text-xs font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                      >
+                        <option value="patch">Patch Release (+0.0.1)</option>
+                        <option value="minor">Minor Release (+0.1.0)</option>
+                      </select>
+                    </div>
+
+                    <div className="sm:col-span-2">
+                      <label
+                        htmlFor="ota-changelog-input"
+                        className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                      >
+                        Release Notes / Changelog Entry
+                      </label>
+                      <input
+                        id="ota-changelog-input"
+                        type="text"
+                        value={otaReleaseNote}
+                        onChange={(e) => setOtaReleaseNote(e.target.value)}
+                        placeholder="Describe what changed in this software update..."
+                        className="w-full px-3 py-2 text-xs font-mono bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      disabled={isPushingOta}
+                      data-testid="push-ota-update-btn"
+                      onClick={async () => {
+                        setIsPushingOta(true);
+                        try {
+                          const rel = await onPushSoftwareUpdateOta({
+                            bumpType: otaBumpType,
+                            channel: settings.autoUpdateChannel,
+                            changelog: [
+                              otaReleaseNote.trim() ||
+                                'Autonomous OTA update pushed to Desktop & Harness bridge',
+                            ],
+                          });
+                          showToast(
+                            `Pushed OTA Update v${rel.version} (${rel.buildHash}) — auto-applied on Desktop & Connected Harness!`
+                          );
+                        } catch (err: unknown) {
+                          setLocalError(
+                            err instanceof Error ? err.message : 'Failed to push OTA update'
+                          );
+                        } finally {
+                          setIsPushingOta(false);
+                        }
+                      }}
+                      className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 rounded-lg shadow-xs transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <Zap className="w-3.5 h-3.5" />
+                      <span>
+                        {isPushingOta
+                          ? 'Broadcasting OTA Release...'
+                          : 'Push OTA Update Now (Auto-Update Desktop & Harness)'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Live Auto-Update History Ledger */}
+              <div className="p-4 bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-xl space-y-2.5">
+                <div className="font-bold text-slate-900 dark:text-slate-100">
+                  Autonomous OTA Update Ledger ({updateHistory.length})
+                </div>
+                {updateHistory.length === 0 ? (
+                  <div className="text-xs text-slate-500 dark:text-slate-400">
+                    Running initial release v{currentVersion} ({currentBuildHash}). Push an OTA update above or via <code className="font-mono">plugin.pushUpdate</code> RPC to watch autonomous hot-swapping in real time.
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-44 overflow-y-auto">
+                    {updateHistory.map((item) => (
+                      <div
+                        key={item.id}
+                        className="p-2.5 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-xs space-y-1"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2 font-mono">
+                          <span className="font-semibold text-emerald-600 dark:text-emerald-400">
+                            v{item.fromVersion} → v{item.toVersion} ({item.buildHash})
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            {item.appliedAt.slice(11, 19)} UTC · {item.targetsUpdated.join(' + ')}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-600 dark:text-slate-300">
+                          {item.changelog[0]}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}

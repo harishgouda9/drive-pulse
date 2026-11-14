@@ -509,3 +509,59 @@ test('virtualScrollEngine computes O(1) virtualized window slices, filters match
   });
   assert.equal(targetScroll, (500 - 1) * 24 - (480 - 24) / 2);
 });
+
+test('autoUpdateEngine compares semver, increments patch releases, evaluates autonomous desktop & Harness update decisions, and builds JSON-RPC 2.0 OTA frames', async () => {
+  const {
+    buildHarnessUpdatePostMessage,
+    bumpPatchVersion,
+    compareSemver,
+    evaluateUpdateDecision,
+  } = await import('./autoUpdateEngine');
+
+  assert.equal(compareSemver('2.5.0', '2.5.0'), 0);
+  assert.equal(compareSemver('2.5.1', '2.5.0'), 1);
+  assert.equal(compareSemver('2.4.9', '2.5.0'), -1);
+  assert.equal(bumpPatchVersion('2.5.0'), '2.5.1');
+
+  const remoteRelease = {
+    version: '2.5.1',
+    buildHash: 'b-2510-ota',
+    channel: 'stable' as const,
+    publishedAt: '2026-11-14T16:00:00.000Z',
+    changelog: ['Hot-swapped desktop service worker and Harness plugin bridge.'],
+    critical: false,
+    autoApplyDelayMs: 500,
+    targets: ['desktop_pwa' as const, 'harness_plugin' as const],
+  };
+
+  const decision = evaluateUpdateDecision({
+    currentVersion: '2.5.0',
+    currentBuildHash: 'b-2500-ota',
+    remoteRelease,
+    autoUpdateEnabled: true,
+    autoUpdateHarnessPlugin: true,
+  });
+
+  assert.equal(decision.updateAvailable, true);
+  assert.equal(decision.shouldAutoApplyDesktop, true);
+  assert.equal(decision.shouldAutoNotifyHarness, true);
+  assert.equal(decision.reason, 'NEW_SEMVER');
+
+  const upToDateDecision = evaluateUpdateDecision({
+    currentVersion: '2.5.1',
+    currentBuildHash: 'b-2510-ota',
+    remoteRelease,
+    autoUpdateEnabled: true,
+    autoUpdateHarnessPlugin: true,
+  });
+  assert.equal(upToDateDecision.updateAvailable, false);
+  assert.equal(upToDateDecision.reason, 'UP_TO_DATE');
+
+  const rpcFrame = buildHarnessUpdatePostMessage(remoteRelease, '2.5.0', 'AUTO_APPLIED');
+  assert.equal(rpcFrame.source, 'drivepulse-plugin-bridge');
+  assert.equal(rpcFrame.method, 'plugin.autoUpdate');
+  assert.equal(rpcFrame.params.previousVersion, '2.5.0');
+  assert.equal(rpcFrame.params.version, '2.5.1');
+  assert.equal(rpcFrame.params.status, 'AUTO_APPLIED');
+});
+

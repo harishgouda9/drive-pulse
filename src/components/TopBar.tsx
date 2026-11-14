@@ -1,6 +1,9 @@
 import React from 'react';
+import { RefreshCw, CheckCircle2, Sparkles } from 'lucide-react';
 import { DriveAuthUser } from '../services/authService';
 import { WorkspaceView } from '../types/drive';
+import { AutoUpdaterStatus } from '../hooks/useAutoUpdater';
+import { SoftwareReleaseManifest } from '../core/autoUpdateEngine';
 
 interface TopBarProps {
   activeView: WorkspaceView;
@@ -10,6 +13,12 @@ interface TopBarProps {
   isLoggingIn: boolean;
   onGoogleLogin: () => void;
   onLogout: () => void;
+  currentVersion?: string;
+  autoUpdateEnabled?: boolean;
+  updateStatus?: AutoUpdaterStatus;
+  pendingRelease?: SoftwareReleaseManifest | null;
+  onOpenAutoUpdateCenter?: () => void;
+  onApplyPendingUpdate?: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -20,6 +29,12 @@ export const TopBar: React.FC<TopBarProps> = ({
   isLoggingIn,
   onGoogleLogin,
   onLogout,
+  currentVersion = '2.5.0',
+  autoUpdateEnabled = true,
+  updateStatus = 'UP_TO_DATE',
+  pendingRelease = null,
+  onOpenAutoUpdateCenter,
+  onApplyPendingUpdate,
 }) => {
   const navItems: Array<{ id: WorkspaceView; label: string }> = [
     { id: WorkspaceView.EXPLORER, label: 'Explorer' },
@@ -29,18 +44,76 @@ export const TopBar: React.FC<TopBarProps> = ({
   ];
 
   return (
-    <header className="flex items-center justify-between gap-8 px-6 py-3.5 bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800">
-      {/* Zone 1: Single text element wordmark */}
-      <a
-        href="#explorer"
-        onClick={(e) => {
-          e.preventDefault();
-          onSelectView(WorkspaceView.EXPLORER);
-        }}
-        className="text-lg font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0 font-display"
-      >
-        DrivePulse
-      </a>
+    <header className="flex items-center justify-between gap-6 px-6 py-3.5 bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800">
+      {/* Zone 1: Brand Wordmark + Live OTA Auto-Update Status Trigger */}
+      <div className="flex items-center gap-3 shrink-0">
+        <a
+          href="#explorer"
+          onClick={(e) => {
+            e.preventDefault();
+            onSelectView(WorkspaceView.EXPLORER);
+          }}
+          className="text-lg font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap font-display"
+        >
+          DrivePulse
+        </a>
+
+        {onOpenAutoUpdateCenter && (
+          <button
+            type="button"
+            onClick={onOpenAutoUpdateCenter}
+            data-testid="topbar-autoupdate-status"
+            title="Open Over-The-Air (OTA) Auto-Update Center for Desktop & Connected Harness"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-mono transition-colors cursor-pointer border ${
+              updateStatus === 'AUTO_APPLYING'
+                ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-700'
+                : updateStatus === 'JUST_UPDATED'
+                ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-300 dark:border-emerald-700 font-semibold'
+                : updateStatus === 'UPDATE_AVAILABLE'
+                ? 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border-amber-300 dark:border-amber-700 font-semibold'
+                : 'bg-slate-100 dark:bg-slate-800/80 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-200/70 dark:hover:bg-slate-800'
+            }`}
+          >
+            {updateStatus === 'AUTO_APPLYING' ? (
+              <>
+                <RefreshCw className="w-3 h-3 animate-spin text-blue-600 dark:text-blue-400" />
+                <span>Auto-Updating Desktop & Harness...</span>
+              </>
+            ) : updateStatus === 'JUST_UPDATED' ? (
+              <>
+                <CheckCircle2 className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
+                <span>Updated v{currentVersion} Live</span>
+              </>
+            ) : updateStatus === 'UPDATE_AVAILABLE' && pendingRelease ? (
+              <>
+                <Sparkles className="w-3 h-3 text-amber-500" />
+                <span>Update v{pendingRelease.version} Ready</span>
+              </>
+            ) : (
+              <>
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    autoUpdateEnabled ? 'bg-emerald-500' : 'bg-slate-400'
+                  }`}
+                />
+                <span>v{currentVersion}</span>
+                <span aria-hidden="true">·</span>
+                <span>{autoUpdateEnabled ? 'Auto-Update ON' : 'Manual Update'}</span>
+              </>
+            )}
+          </button>
+        )}
+
+        {pendingRelease && onApplyPendingUpdate && (
+          <button
+            type="button"
+            onClick={onApplyPendingUpdate}
+            className="px-2.5 py-1 text-[11px] font-semibold text-white bg-blue-600 hover:bg-blue-500 rounded-md cursor-pointer"
+          >
+            Apply v{pendingRelease.version} Now
+          </button>
+        )}
+      </div>
 
       {/* Zone 2: 4 concise single-line text navigation links */}
       <nav aria-label="Primary Workspace Navigation" className="flex items-center gap-6 text-sm font-medium">
