@@ -1,0 +1,732 @@
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import express, { Request, Response } from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { DriveLruCache } from './src/core/lruCache';
+import { computeFastChecksum } from './src/core/chunkStreamer';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const serverCache = new DriveLruCache(128 * 1024 * 1024);
+let deltaSequence = 1;
+
+function base64UrlEncode(input: string | Buffer): string {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function getGenAIClient(): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json({ limit: '25mb' }));
+
+  app.get('/api/health', (_req: Request, res: Response) => {
+    res.json({
+      status: 'ok',
+      bridge: 'drivepulse-harness-bridge',
+      cacheTelemetry: serverCache.getTelemetry(),
+    });
+  });
+
+  // Real-Time Google Cloud Service Account JSON -> OAuth 2.0 Bearer Token Exchange
+  // Completely bypasses browser OAuth Consent Screen ("Error 403: access_denied") for Harnesses & Agents
+  app.post('/api/auth/service-account', async (req: Request, res: Response) => {
+    const start = performance.now();
+    try {
+      const { serviceAccountJson, scope } = req.body as {
+        serviceAccountJson?: string;
+        scope?: string;
+      };
+      if (!serviceAccountJson || !serviceAccountJson.trim()) {
+        res.status(400).json({ error: 'Service Account JSON key is required.' });
+        return;
+      }
+
+      const parsed = JSON.parse(serviceAccountJson) as {
+        client_email?: string;
+        private_key?: string;
+        token_uri?: string;
+        project_id?: string;
+      };
+
+      if (!parsed.client_email || !parsed.private_key) {
+        res.status(400).json({
+          error: 'Invalid Service Account JSON: missing "client_email" or "private_key".',
+        });
+        return;
+      }
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const tokenUri = parsed.token_uri || 'https://oauth2.googleapis.com/token';
+      const targetScope = scope || 'https://www.googleapis.com/auth/drive';
+
+      const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+      const claimSet = base64UrlEncode(
+        JSON.stringify({
+          iss: parsed.client_email,
+          scope: targetScope,
+          aud: tokenUri,
+          iat: nowSec,
+          exp: nowSec + 3600,
+        })
+      );
+
+      const unsignedJwt = `${header}.${claimSet}`;
+      const signer = crypto.createSign('RSA-SHA256');
+      signer.update(unsignedJwt);
+      signer.end();
+      const signature = base64UrlEncode(signer.sign(parsed.private_key));
+      const signedAssertion = `${unsignedJwt}.${signature}`;
+
+      const tokenRes = await fetch(tokenUri, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: signedAssertion,
+        }).toString(),
+      });
+
+      const tokenData = (await tokenRes.json()) as {
+        access_token?: string;
+        expires_in?: number;
+        error?: string;
+        error_description?: string;
+      };
+
+      if (!tokenRes.ok || !tokenData.access_token) {
+        res.status(tokenRes.status || 400).json({
+          error:
+            tokenData.error_description ||
+            tokenData.error ||
+            'Failed to exchange Service Account JWT for Google Drive access token.',
+        });
+        return;
+      }
+
+      const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+      res.json({
+        accessToken: tokenData.access_token,
+        clientEmail: parsed.client_email,
+        projectId: parsed.project_id || '',
+        expiresIn: tokenData.expires_in || 3600,
+        latencyMs,
+      });
+    } catch (err: unknown) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Service Account authentication failed',
+      });
+    }
+  });
+
+  // Real-Time OAuth 2.0 Refresh Token -> Access Token Exchange
+  app.post('/api/auth/refresh-token', async (req: Request, res: Response) => {
+    const start = performance.now();
+    try {
+      const { clientId, clientSecret, refreshToken } = req.body as {
+        clientId?: string;
+        clientSecret?: string;
+        refreshToken?: string;
+      };
+      if (!clientId?.trim() || !clientSecret?.trim() || !refreshToken?.trim()) {
+        res.status(400).json({
+          error: 'Client ID, Client Secret, and Refresh Token are all required.',
+        });
+        return;
+      }
+
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: clientId.trim(),
+          client_secret: clientSecret.trim(),
+          refresh_token: refreshToken.trim(),
+          grant_type: 'refresh_token',
+        }).toString(),
+      });
+
+      const tokenData = (await tokenRes.json()) as {
+        access_token?: string;
+        expires_in?: number;
+        scope?: string;
+        error?: string;
+        error_description?: string;
+      };
+
+      if (!tokenRes.ok || !tokenData.access_token) {
+        res.status(tokenRes.status || 400).json({
+          error:
+            tokenData.error_description ||
+            tokenData.error ||
+            'Failed to exchange Refresh Token with Google OAuth.',
+        });
+        return;
+      }
+
+      const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+      res.json({
+        accessToken: tokenData.access_token,
+        expiresIn: tokenData.expires_in || 3600,
+        scope: tokenData.scope || 'https://www.googleapis.com/auth/drive',
+        latencyMs,
+      });
+    } catch (err: unknown) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Refresh token exchange failed',
+      });
+    }
+  });
+
+  // Real-Time Google Drive / Docs / Sheets File Content Fetcher & Importer
+  // Supports both authenticated OAuth Bearer tokens (Google Drive API v3) and direct shared link export
+  app.post('/api/drive/import-link', async (req: Request, res: Response) => {
+    const start = performance.now();
+    const authHeader = req.headers.authorization;
+    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const { fileId, resourceType } = req.body as {
+      fileId?: string;
+      resourceType?: 'document' | 'spreadsheet' | 'presentation' | 'file';
+    };
+
+    if (!fileId || !fileId.trim()) {
+      res.status(400).json({ error: 'A valid Google Drive File ID or URL is required.' });
+      return;
+    }
+
+    const cleanId = fileId.trim();
+
+    try {
+      // 1. If OAuth Bearer token is available, fetch metadata + content directly via Drive API v3
+      if (bearerToken) {
+        const metaUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+          cleanId
+        )}?supportsAllDrives=true&fields=id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink`;
+        const metaRes = await fetch(metaUrl, {
+          headers: { Authorization: `Bearer ${bearerToken}` },
+        });
+
+        if (metaRes.ok) {
+          const meta = (await metaRes.json()) as {
+            id?: string;
+            name?: string;
+            mimeType?: string;
+            size?: string | number;
+            modifiedTime?: string;
+            md5Checksum?: string;
+            webViewLink?: string;
+          };
+
+          const mime = String(meta.mimeType || 'text/plain');
+          let contentUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+            cleanId
+          )}?alt=media&supportsAllDrives=true`;
+
+          if (mime === 'application/vnd.google-apps.document') {
+            contentUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+              cleanId
+            )}/export?mimeType=text/plain`;
+          } else if (mime === 'application/vnd.google-apps.spreadsheet') {
+            contentUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+              cleanId
+            )}/export?mimeType=text/csv`;
+          } else if (mime === 'application/vnd.google-apps.presentation') {
+            contentUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+              cleanId
+            )}/export?mimeType=text/plain`;
+          } else if (mime === 'application/vnd.google-apps.script') {
+            contentUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
+              cleanId
+            )}/export?mimeType=application/vnd.google-apps.script+json`;
+          }
+
+          const contentRes = await fetch(contentUrl, {
+            headers: { Authorization: `Bearer ${bearerToken}` },
+          });
+
+          let content = '';
+          if (contentRes.ok) {
+            content = await contentRes.text();
+          } else {
+            content = `[Google Drive File Metadata]\nName: ${meta.name}\nID: ${cleanId}\nMIME Type: ${mime}\nModified: ${meta.modifiedTime}\nWeb Link: ${meta.webViewLink || 'N/A'}`;
+          }
+
+          const checksum = String(meta.md5Checksum || computeFastChecksum(content));
+          const fileName = String(meta.name || `drive-${cleanId.slice(0, 8)}.txt`);
+          const entry = serverCache.put(cleanId, fileName, checksum, content);
+          const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+
+          res.json({
+            id: cleanId,
+            name: fileName,
+            mimeType: mime,
+            size: entry.byteSize,
+            modifiedTime: String(meta.modifiedTime || new Date().toISOString()),
+            md5Checksum: checksum,
+            webViewLink: meta.webViewLink,
+            content,
+            latencyMs,
+            source: 'live_drive',
+          });
+          return;
+        }
+      }
+
+      // 2. Fallback for link-shared Google Docs / Sheets / Slides / Drive files without requiring OAuth popup
+      let exportUrl = `https://drive.google.com/uc?export=download&id=${encodeURIComponent(cleanId)}`;
+      let defaultMime = 'text/plain';
+      let defaultExt = '.txt';
+
+      if (resourceType === 'document') {
+        exportUrl = `https://docs.google.com/document/d/${encodeURIComponent(cleanId)}/export?format=txt`;
+        defaultMime = 'application/vnd.google-apps.document';
+        defaultExt = '.doc.txt';
+      } else if (resourceType === 'spreadsheet') {
+        exportUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(cleanId)}/export?format=csv`;
+        defaultMime = 'application/vnd.google-apps.spreadsheet';
+        defaultExt = '.csv';
+      } else if (resourceType === 'presentation') {
+        exportUrl = `https://docs.google.com/presentation/d/${encodeURIComponent(cleanId)}/export/txt`;
+        defaultMime = 'application/vnd.google-apps.presentation';
+        defaultExt = '.slides.txt';
+      }
+
+      const sharedRes = await fetch(exportUrl, {
+        headers: {
+          'User-Agent': 'DrivePulse-Harness-Bridge/1.0',
+        },
+      });
+
+      if (!sharedRes.ok) {
+        res.status(sharedRes.status || 400).json({
+          error: `Could not read file "${cleanId}" (HTTP ${sharedRes.status}). Ensure the file is shared ("Anyone with the link") or sign in via Google OAuth / Service Account in Settings.`,
+        });
+        return;
+      }
+
+      const contentType = sharedRes.headers.get('content-type') || defaultMime;
+      if (contentType.includes('text/html') && !bearerToken) {
+        res.status(403).json({
+          error:
+            'This Google Drive file is private and requires authentication. Sign in with Google Drive or configure a Service Account / OAuth token in Settings.',
+        });
+        return;
+      }
+
+      const content = await sharedRes.text();
+      const disp = sharedRes.headers.get('content-disposition') || '';
+      const nameMatch = disp.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)["']?/i);
+      const fileName = nameMatch
+        ? decodeURIComponent(nameMatch[1])
+        : `drive-${cleanId.slice(0, 10)}${defaultExt}`;
+      const checksum = computeFastChecksum(content);
+      const entry = serverCache.put(cleanId, fileName, checksum, content);
+      const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+
+      res.json({
+        id: cleanId,
+        name: fileName,
+        mimeType: defaultMime,
+        size: entry.byteSize,
+        modifiedTime: new Date().toISOString(),
+        md5Checksum: checksum,
+        webViewLink: `https://drive.google.com/file/d/${cleanId}/view`,
+        content,
+        latencyMs,
+        source: 'live_drive',
+      });
+    } catch (err: unknown) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to fetch Google Drive file content',
+      });
+    }
+  });
+
+  // High-Thinking Agentic Analysis Route (gemini-4-carbon + ThinkingLevel.HIGH)
+  app.post('/api/agent/analyze', async (req: Request, res: Response) => {
+    const start = performance.now();
+    const { query, contextFiles } = req.body as {
+      query?: string;
+      contextFiles?: Array<{ id: string; name: string; mimeType: string; content: string }>;
+    };
+
+    if (!query || !query.trim()) {
+      res.status(400).json({ error: 'Query is required for high-thinking analysis.' });
+      return;
+    }
+
+    const filesContextText = (contextFiles || [])
+      .map(
+        (f, idx) =>
+          `--- FILE ${idx + 1}: ${f.name} (${f.mimeType}, id=${f.id}) ---\n${f.content.slice(0, 12000)}`
+      )
+      .join('\n\n');
+
+    const prompt = `You are the DrivePulse High-Thinking Harness Architect. Analyze the user's request across the synchronized Google Drive context files below.
+
+Synchronized Google Drive Files Context:
+${filesContextText || 'No files attached.'}
+
+User Request:
+${query}
+
+Provide a deep architectural synthesis, root-cause or cross-file insights, and concrete actionable file artifacts that can be written back to Google Drive.`;
+
+    try {
+      const ai = getGenAIClient();
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-carbon',
+        contents: prompt,
+        config: {
+          systemInstruction:
+            'You are a principal distributed-systems and AI harness architect. Return structured JSON containing thinkingSummary, answerMarkdown, and suggestedActions.',
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.HIGH,
+          },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              thinkingSummary: {
+                type: Type.STRING,
+                description:
+                  'Detailed multi-step architectural reasoning trace explaining how the synchronized Drive files were cross-referenced.',
+              },
+              answerMarkdown: {
+                type: Type.STRING,
+                description: 'Comprehensive synthesis and actionable technical answer.',
+              },
+              suggestedActions: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    label: {
+                      type: Type.STRING,
+                      description: 'Action button label',
+                    },
+                    fileName: {
+                      type: Type.STRING,
+                      description: 'Target filename to save into Google Drive',
+                    },
+                    contentToSave: {
+                      type: Type.STRING,
+                      description: 'Complete file content to upload to Google Drive',
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const rawText = (response.text ?? '{}').trim();
+      const parsed = JSON.parse(rawText);
+      const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+
+      res.json({
+        id: `ag-${Date.now().toString(36)}`,
+        query,
+        model: 'gemini-4-carbon',
+        thinkingLevel: 'HIGH',
+        thinkingSummary: parsed.thinkingSummary || '',
+        answerMarkdown: parsed.answerMarkdown || rawText,
+        referencedFiles: (contextFiles || []).map((f) => f.name),
+        suggestedActions: Array.isArray(parsed.suggestedActions) ? parsed.suggestedActions : [],
+        latencyMs,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error: unknown) {
+      const errMessage = error instanceof Error ? error.message : String(error);
+      let guidanceNote = errMessage;
+      if (
+        errMessage.includes('403') ||
+        errMessage.includes('PERMISSION_DENIED') ||
+        errMessage.includes('400') ||
+        errMessage.includes('API_KEY_INVALID')
+      ) {
+        guidanceNote = `${errMessage} — Please check or select a valid API key in the Settings > Secrets panel.`;
+      } else if (errMessage.includes('429') || errMessage.includes('RESOURCE_EXHAUSTED')) {
+        guidanceNote = `${errMessage} — Upgrading to a paid tier increases quota; select a billing-enabled API key in the Settings > Secrets panel.`;
+      }
+      res.status(502).json({ error: guidanceNote });
+    }
+  });
+
+  // Universal Plugin Manifest for Harness CI/CD, IDP, MCP Clients & Host Software
+  app.get('/api/plugin/manifest.json', (req: Request, res: Response) => {
+    const origin = `${req.protocol}://${req.get('host')}`;
+    res.json({
+      schemaVersion: '2.0',
+      pluginId: 'drivepulse-harness-bridge',
+      name: 'DrivePulse Google Drive Harness Plugin',
+      version: '2.4.0',
+      description:
+        'Ultra-low-latency Google Drive data plane plugin with in-memory LRU caching, 64KB chunked streaming, real-time filename search, and bidirectional Web SDK / MCP JSON-RPC interfaces for Harness pipelines, AI agents, and host software.',
+      endpoints: {
+        mcpRpc: `${origin}/api/mcp/rpc`,
+        importDriveLink: `${origin}/api/drive/import-link`,
+        serviceAccountAuth: `${origin}/api/auth/service-account`,
+        agentAnalyze: `${origin}/api/agent/analyze`,
+        embedUrl: `${origin}/?embed=plugin`,
+      },
+      transports: ['REST_MCP_JSON_RPC', 'WEB_SDK_POSTMESSAGE'],
+      supportedMethods: [
+        'plugin.handshake',
+        'drive.list',
+        'drive.search',
+        'drive.read',
+        'drive.upload',
+        'drive.delete',
+        'drive.deltaSync',
+      ],
+      cacheTelemetry: serverCache.getTelemetry(),
+    });
+  });
+
+  // MCP / JSON-RPC Harness Bridge Endpoint for External AI Agents & CLI Software
+  app.post('/api/mcp/rpc', async (req: Request, res: Response) => {
+    const start = performance.now();
+    const authHeader = req.headers.authorization;
+    const { id = 'rpc-1', method, params = {} } = req.body as {
+      jsonrpc?: string;
+      id?: string | number;
+      method?: string;
+      params?: Record<string, unknown>;
+    };
+
+    if (!method) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32600, message: 'Missing RPC method name' },
+      });
+      return;
+    }
+
+    try {
+      if (method === 'plugin.handshake') {
+        const entries = serverCache.entries();
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            pluginId: 'drivepulse-harness-bridge',
+            version: '2.4.0',
+            status: 'READY',
+            mountedFileCount: entries.length,
+            supportedMethods: [
+              'plugin.handshake',
+              'drive.list',
+              'drive.search',
+              'drive.read',
+              'drive.upload',
+              'drive.delete',
+              'drive.deltaSync',
+            ],
+            cacheTelemetry: serverCache.getTelemetry(),
+            latencyMs,
+            cacheStatus: 'HIT',
+          },
+        });
+        return;
+      }
+
+      if (method === 'drive.list') {
+        const entries = serverCache.entries();
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            authenticatedBearer: Boolean(authHeader?.startsWith('Bearer ')),
+            count: entries.length,
+            files: entries.map((e) => ({
+              fileId: e.fileId,
+              fileName: e.fileName,
+              checksum: e.checksum,
+              byteSize: e.byteSize,
+              hitCount: e.hitCount,
+              content: e.payload,
+              modifiedTime: new Date(e.lastAccessed).toISOString(),
+            })),
+            latencyMs,
+            cacheStatus: 'HIT',
+          },
+        });
+        return;
+      }
+
+      if (method === 'drive.search') {
+        const query = String(params.query || params.fileName || '')
+          .trim()
+          .toLowerCase();
+        const scope = String(params.scope || 'filename');
+        const entries = serverCache.entries();
+        const matched = entries.filter((e) => {
+          if (!query) return true;
+          if (scope === 'all') {
+            return (
+              e.fileName.toLowerCase().includes(query) ||
+              e.payload.toLowerCase().includes(query)
+            );
+          }
+          return e.fileName.toLowerCase().includes(query);
+        });
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            query,
+            scope,
+            totalCached: entries.length,
+            matchedCount: matched.length,
+            files: matched.map((e) => ({
+              fileId: e.fileId,
+              fileName: e.fileName,
+              checksum: e.checksum,
+              byteSize: e.byteSize,
+              hitCount: e.hitCount,
+              content: e.payload,
+              modifiedTime: new Date(e.lastAccessed).toISOString(),
+            })),
+            latencyMs,
+            cacheStatus: 'HIT',
+          },
+        });
+        return;
+      }
+
+      if (method === 'drive.read') {
+        const fileId = String(params.fileId || '');
+        const lookup = serverCache.get(fileId);
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            fileId,
+            cacheStatus: lookup.status,
+            latencyMs: lookup.latencyMs || latencyMs,
+            checksum: lookup.entry?.checksum || null,
+            byteSize: lookup.entry?.byteSize || 0,
+            content: lookup.entry?.payload || '',
+          },
+        });
+        return;
+      }
+
+      if (method === 'drive.upload') {
+        const fileId = String(params.fileId || `drv-${Date.now().toString(36)}`);
+        const fileName = String(params.fileName || params.name || 'artifact.txt');
+        const content = String(params.content || '');
+        const checksum = computeFastChecksum(content);
+        const entry = serverCache.put(fileId, fileName, checksum, content);
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            fileId: entry.fileId,
+            fileName: entry.fileName,
+            checksum: entry.checksum,
+            byteSize: entry.byteSize,
+            cacheStatus: 'HIT',
+            latencyMs,
+          },
+        });
+        return;
+      }
+
+      if (method === 'drive.delete') {
+        const fileId = String(params.fileId || '');
+        const removed = serverCache.delete(fileId);
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            fileId,
+            removed,
+            latencyMs,
+          },
+        });
+        return;
+      }
+
+      if (method === 'drive.deltaSync') {
+        const pageToken = String(params.pageToken || String(deltaSequence));
+        deltaSequence += 1;
+        const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            previousPageToken: pageToken,
+            newStartPageToken: String(deltaSequence),
+            changesDetected: 0,
+            cacheTelemetry: serverCache.getTelemetry(),
+            latencyMs,
+          },
+        });
+        return;
+      }
+
+      res.status(404).json({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32601, message: `Unsupported harness method: ${method}` },
+      });
+    } catch (err: unknown) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32000, message: err instanceof Error ? err.message : 'Internal RPC error' },
+      });
+    }
+  });
+
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`DrivePulse Harness Bridge listening on http://localhost:${PORT}`);
+  });
+}
+
+startServer();

@@ -1,0 +1,6 @@
+{
+  "name": "DrivePulse Harness Bridge",
+  "description": "Ultra-fast Google Drive synchronization plugin and low-latency data bridge for software harnesses and AI agents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

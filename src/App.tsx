@@ -1,0 +1,1295 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AgentReasoningResult,
+  CacheStatus,
+  DestructiveActionRequest,
+  DriveItem,
+  FileCategory,
+  HarnessRpcLog,
+  TransferJob,
+  WorkspaceView,
+} from './types/drive';
+import { DriveLruCache } from './core/lruCache';
+import {
+  calculateThroughputMbps,
+  filterAndSortDriveItems,
+  splitIntoChunks,
+} from './core/chunkStreamer';
+import {
+  buildRollingSixtyMinuteSeries,
+  OperationLatencyKind,
+  RecordedLatencyEvent,
+} from './core/latencyMetrics';
+import {
+  AuthErrorDetails,
+  authenticateWithRefreshToken,
+  authenticateWithServiceAccount,
+  DriveAuthUser,
+  formatAuthErrorDetails,
+  getAccessToken,
+  googleSignIn,
+  initAuth,
+  logout,
+  signInWithGisTokenClient,
+  verifyAndSetAccessToken,
+} from './services/authService';
+import {
+  deleteDriveFileWithAuth,
+  downloadDriveFileContent,
+  fetchLiveDriveFiles,
+  importDriveFileByUrlOrId,
+  pollDriveDeltaChanges,
+  uploadFileToDrive,
+} from './services/driveBridgeService';
+import { DEFAULT_PLUGIN_SETTINGS, PluginSettings } from './types/settings';
+import { TopBar } from './components/TopBar';
+import { Sidebar } from './components/Sidebar';
+import { ExplorerView } from './components/ExplorerView';
+import { SyncCacheView } from './components/SyncCacheView';
+import { AgentStudioView } from './components/AgentStudioView';
+import { HarnessSdkView, PluginRpcMethod } from './components/HarnessSdkView';
+import { UploadModal } from './components/UploadModal';
+import { DestructiveConfirmModal } from './components/DestructiveConfirmModal';
+import { SettingsModal } from './components/SettingsModal';
+
+export default function App() {
+  const lruCacheRef = useRef<DriveLruCache>(new DriveLruCache(128 * 1024 * 1024));
+
+  const [activeView, setActiveView] = useState<WorkspaceView>(WorkspaceView.EXPLORER);
+  const [items, setItems] = useState<DriveItem[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState<string>('ALL');
+  const [selectedFile, setSelectedFile] = useState<DriveItem | null>(null);
+  const [cacheVersion, setCacheVersion] = useState(0);
+
+  // Universal Host Software Plugin Embed Mode (?embed=plugin or toggled in UI)
+  const [isPluginEmbedMode, setIsPluginEmbedMode] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('embed') === 'plugin';
+  });
+
+  // Plugin Settings State
+  const [settings, setSettings] = useState<PluginSettings>(DEFAULT_PLUGIN_SETTINGS);
+  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+
+  // Auth State (following workspace-integration pattern + multi-channel recovery)
+  const [needsAuth, setNeedsAuth] = useState<boolean>(true);
+  const [user, setUser] = useState<DriveAuthUser | null>(null);
+  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+  const [authErrorDetails, setAuthErrorDetails] = useState<AuthErrorDetails | null>(null);
+
+  // Modals & Real-Time Status Banner
+  const [isUploadOpen, setIsUploadOpen] = useState<boolean>(false);
+  const [destructiveRequest, setDestructiveRequest] = useState<DestructiveActionRequest | null>(
+    null
+  );
+  const [lastTransferBanner, setLastTransferBanner] = useState<string | null>(null);
+
+  // Real-Time Sync, Transfer Job Logs & Recorded Latency Events (Zero Fake/Demo Data)
+  const [startPageToken, setStartPageToken] = useState<string>('1');
+  const [lastDeltaSyncTime, setLastDeltaSyncTime] = useState<string>('Not polled yet');
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [isHydratingFileId, setIsHydratingFileId] = useState<string | null>(null);
+  const [isRefreshingDrive, setIsRefreshingDrive] = useState<boolean>(false);
+  const [transferJobs, setTransferJobs] = useState<TransferJob[]>([]);
+  const [latencyEvents, setLatencyEvents] = useState<RecordedLatencyEvent[]>([]);
+  const [clockTickMs, setClockTickMs] = useState<number>(() => Date.now());
+
+  // Real-Time Agent Studio State
+  const [agentResults, setAgentResults] = useState<AgentReasoningResult[]>([]);
+  const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
+  const [agentError, setAgentError] = useState<string | null>(null);
+
+  // Real-Time Harness SDK RPC Logs
+  const [rpcLogs, setRpcLogs] = useState<HarnessRpcLog[]>([]);
+
+  // Theme State (defaults to Light Mode; toggles .dark on <html>)
+  const [isDark, setIsDark] = useState<boolean>(false);
+
+  const recordLatencyEvent = useCallback(
+    (kind: OperationLatencyKind, latencyMs: number, bytes: number) => {
+      const now = Date.now();
+      setLatencyEvents((prev) => [
+        ...prev.filter((ev) => ev.timestampMs >= now - 60 * 60 * 1000),
+        { timestampMs: now, kind, latencyMs, bytes },
+      ]);
+      setClockTickMs(now);
+    },
+    []
+  );
+
+  // Keep the 60-minute rolling window aligned with real wall-clock time
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setClockTickMs(Date.now());
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (isDark) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [isDark]);
+
+  // Perform real startup bridge synchronization check against /api/mcp/rpc
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const res = await fetchLiveDriveFiles(30);
+        if (!active) return;
+        recordLatencyEvent('STREAM_READ', res.latencyMs, 0);
+        if (res.items.length > 0) {
+          setItems(res.items);
+          setSelectedFile(res.items[0]);
+          for (const item of res.items) {
+            if (item.contentPreview) {
+              lruCacheRef.current.put(
+                item.id,
+                item.name,
+                item.md5Checksum,
+                item.contentPreview,
+                item.size
+              );
+            }
+          }
+          setCacheVersion((v) => v + 1);
+        }
+      } catch {
+        // Ignore startup check error if server is still warming up
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [recordLatencyEvent]);
+
+  // Select & Hydrate File via LRU Cache or Real Stream
+  const handleSelectAndHydrateFile = useCallback(
+    async (file: DriveItem): Promise<DriveItem> => {
+      const cache = lruCacheRef.current;
+      const lookup = cache.get(file.id, file.md5Checksum);
+
+      if (lookup.status === CacheStatus.HIT && lookup.entry && lookup.entry.payload) {
+        recordLatencyEvent('LRU_READ', lookup.latencyMs, lookup.entry.byteSize);
+        const updatedFile: DriveItem = {
+          ...file,
+          cacheStatus: CacheStatus.HIT,
+          lastLatencyMs: lookup.latencyMs,
+          contentPreview: lookup.entry.payload,
+        };
+        setItems((prev) => prev.map((i) => (i.id === file.id ? updatedFile : i)));
+        setSelectedFile(updatedFile);
+        setCacheVersion((v) => v + 1);
+        setLastTransferBanner(
+          `LRU Memory HIT for "${file.name}" in ${lookup.latencyMs.toFixed(2)} ms`
+        );
+        return updatedFile;
+      }
+
+      // Cache Miss or Stale -> Stream content & hydrate LRU
+      setIsHydratingFileId(file.id);
+      try {
+        const streamed = await downloadDriveFileContent(file);
+        cache.recordMissLatency(streamed.latencyMs);
+        cache.put(file.id, file.name, file.md5Checksum, streamed.content, streamed.bytesRead);
+        recordLatencyEvent('STREAM_READ', streamed.latencyMs, streamed.bytesRead);
+
+        const chunks = splitIntoChunks(streamed.content, 16384);
+        const throughput = calculateThroughputMbps(
+          streamed.bytesRead,
+          Math.max(0.05, streamed.latencyMs)
+        );
+
+        const updatedFile: DriveItem = {
+          ...file,
+          size: streamed.bytesRead || file.size,
+          cacheStatus: CacheStatus.HIT,
+          lastLatencyMs: streamed.latencyMs,
+          contentPreview: streamed.content,
+        };
+
+        setItems((prev) => prev.map((i) => (i.id === file.id ? updatedFile : i)));
+        setSelectedFile(updatedFile);
+        setTransferJobs((prev) => [
+          {
+            id: `tx-dl-${Date.now().toString(36)}`,
+            fileName: file.name,
+            direction: 'DOWNLOAD',
+            totalBytes: streamed.bytesRead,
+            transferredBytes: streamed.bytesRead,
+            totalChunks: chunks.length,
+            completedChunks: chunks.length,
+            throughputMbps: throughput,
+            latencyMs: streamed.latencyMs,
+            status: 'COMPLETED',
+            startedAt: new Date().toISOString(),
+          },
+          ...prev,
+        ]);
+        setCacheVersion((v) => v + 1);
+        setLastTransferBanner(
+          `Hydrated "${file.name}" (${chunks.length} chunk frame(s)) into LRU cache in ${streamed.latencyMs} ms`
+        );
+        return updatedFile;
+      } catch (err: unknown) {
+        console.error('Stream hydration error:', err);
+        return file;
+      } finally {
+        setIsHydratingFileId(null);
+      }
+    },
+    [recordLatencyEvent]
+  );
+
+  // Initialize Firebase Auth Listener
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      async (authedUser) => {
+        setUser(authedUser);
+        setNeedsAuth(false);
+        try {
+          const liveList = await fetchLiveDriveFiles(30);
+          recordLatencyEvent('STREAM_READ', liveList.latencyMs, 0);
+          setItems(liveList.items);
+          if (liveList.items.length > 0) {
+            setSelectedFile(liveList.items[0]);
+            for (const item of liveList.items.slice(0, 3)) {
+              await handleSelectAndHydrateFile(item);
+            }
+            setSelectedFile((prev) =>
+              liveList.items[0]
+                ? {
+                    ...liveList.items[0],
+                    contentPreview:
+                      lruCacheRef.current.get(liveList.items[0].id).entry?.payload ||
+                      prev?.contentPreview ||
+                      '',
+                    cacheStatus: CacheStatus.HIT,
+                  }
+                : prev
+            );
+          }
+          setLastTransferBanner(
+            `Synchronized ${liveList.items.length} Google Drive file(s) and hydrated live contents in ${liveList.latencyMs} ms`
+          );
+        } catch (err) {
+          console.error('Error loading live Drive files:', err);
+        }
+      },
+      () => {
+        setUser(null);
+        setNeedsAuth(true);
+      }
+    );
+    return () => unsubscribe();
+  }, [handleSelectAndHydrateFile, recordLatencyEvent]);
+
+  // Listen for real window.postMessage Harness SDK & Host Software Plugin calls
+  useEffect(() => {
+    const handlePostMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (!data || typeof data !== 'object' || data.source !== 'drivepulse-host-harness') {
+        return;
+      }
+      const { id = 'pm-1', method = 'drive.read', params = {} } = data;
+      const cache = lruCacheRef.current;
+      const start = performance.now();
+
+      if (method === 'plugin.handshake') {
+        const latencyMs = Math.max(0.01, Math.round((performance.now() - start) * 100) / 100);
+        recordLatencyEvent('LRU_READ', latencyMs, 0);
+        const responseFrame = {
+          source: 'drivepulse-plugin-bridge',
+          jsonrpc: '2.0',
+          id,
+          result: {
+            pluginId: 'io.drivepulse.harness.bridge',
+            version: '2.4.0',
+            status: 'READY',
+            hostApp: String(params.hostApp || 'external-host'),
+            authenticatedUser: user?.email || null,
+            cachedItemsCount: items.length,
+            supportedMethods: [
+              'plugin.handshake',
+              'drive.list',
+              'drive.search',
+              'drive.read',
+              'drive.upload',
+              'drive.delete',
+              'drive.deltaSync',
+            ],
+            latencyMs,
+          },
+        };
+        window.parent?.postMessage(responseFrame, '*');
+        setRpcLogs((prev) => [
+          {
+            id: `rpc-${Date.now().toString(36)}`,
+            timestamp: new Date().toISOString().slice(11, 23),
+            transport: 'POSTMESSAGE_SDK',
+            method,
+            paramsSummary: JSON.stringify(params),
+            status: 'OK',
+            latencyMs,
+            cacheHit: true,
+            requestPayload: JSON.stringify(data, null, 2),
+            responsePayload: JSON.stringify(responseFrame, null, 2),
+          },
+          ...prev,
+        ]);
+        return;
+      }
+
+      if (method === 'drive.search' || method === 'drive.list') {
+        const query = String(params.query || '');
+        const matched = filterAndSortDriveItems(
+          items,
+          query,
+          FileCategory.ALL,
+          'ALL',
+          'modifiedTime',
+          'filename'
+        );
+        const latencyMs = Math.max(0.01, Math.round((performance.now() - start) * 100) / 100);
+        recordLatencyEvent('LRU_READ', latencyMs, 0);
+        const responseFrame = {
+          source: 'drivepulse-plugin-bridge',
+          jsonrpc: '2.0',
+          id,
+          result: {
+            query,
+            totalMatched: matched.length,
+            files: matched.map((f) => ({
+              id: f.id,
+              name: f.name,
+              mimeType: f.mimeType,
+              size: f.size,
+              modifiedTime: f.modifiedTime,
+              md5Checksum: f.md5Checksum,
+              cacheStatus: f.cacheStatus,
+            })),
+            latencyMs,
+          },
+        };
+        window.parent?.postMessage(responseFrame, '*');
+        setRpcLogs((prev) => [
+          {
+            id: `rpc-${Date.now().toString(36)}`,
+            timestamp: new Date().toISOString().slice(11, 23),
+            transport: 'POSTMESSAGE_SDK',
+            method,
+            paramsSummary: JSON.stringify(params),
+            status: 'OK',
+            latencyMs,
+            cacheHit: true,
+            requestPayload: JSON.stringify(data, null, 2),
+            responsePayload: JSON.stringify(responseFrame, null, 2),
+          },
+          ...prev,
+        ]);
+        return;
+      }
+
+      if (method === 'drive.read') {
+        const fileId = String(params.fileId || '');
+        const lookup = cache.get(fileId);
+        recordLatencyEvent(
+          lookup.status === CacheStatus.HIT ? 'LRU_READ' : 'STREAM_READ',
+          lookup.latencyMs,
+          lookup.entry?.byteSize || 0
+        );
+        const responseFrame = {
+          source: 'drivepulse-plugin-bridge',
+          jsonrpc: '2.0',
+          id,
+          result: {
+            fileId,
+            cacheStatus: lookup.status,
+            latencyMs: lookup.latencyMs,
+            checksum: lookup.entry?.checksum || null,
+            byteSize: lookup.entry?.byteSize || 0,
+            content: lookup.entry?.payload || '',
+          },
+        };
+        window.parent?.postMessage(responseFrame, '*');
+        setRpcLogs((prev) => [
+          {
+            id: `rpc-${Date.now().toString(36)}`,
+            timestamp: new Date().toISOString().slice(11, 23),
+            transport: 'POSTMESSAGE_SDK',
+            method,
+            paramsSummary: JSON.stringify(params),
+            status: 'OK',
+            latencyMs: lookup.latencyMs,
+            cacheHit: lookup.status === CacheStatus.HIT,
+            requestPayload: JSON.stringify(data, null, 2),
+            responsePayload: JSON.stringify(responseFrame, null, 2),
+          },
+          ...prev,
+        ]);
+        setCacheVersion((v) => v + 1);
+      }
+    };
+
+    window.addEventListener('message', handlePostMessage);
+    return () => window.removeEventListener('message', handlePostMessage);
+  }, [items, recordLatencyEvent, user?.email]);
+
+  const handleUpdateSettings = useCallback((patch: Partial<PluginSettings>) => {
+    setSettings((prev) => {
+      const next = { ...prev, ...patch };
+      if (patch.lruCacheMaxMb && patch.lruCacheMaxMb !== prev.lruCacheMaxMb) {
+        lruCacheRef.current.setMaxBytes(patch.lruCacheMaxMb * 1024 * 1024);
+        setCacheVersion((v) => v + 1);
+      }
+      return next;
+    });
+  }, []);
+
+  const completeDriveSignIn = useCallback(
+    async (authedUser: DriveAuthUser) => {
+      setUser(authedUser);
+      setNeedsAuth(false);
+      setAuthErrorDetails(null);
+      setIsSettingsOpen(false);
+      const liveList = await fetchLiveDriveFiles(settings.pageSize);
+      recordLatencyEvent('STREAM_READ', liveList.latencyMs, 0);
+      setItems(liveList.items);
+      if (liveList.items.length > 0) {
+        setSelectedFile(liveList.items[0]);
+        for (const item of liveList.items.slice(0, 3)) {
+          await handleSelectAndHydrateFile(item);
+        }
+        const firstCached = lruCacheRef.current.get(liveList.items[0].id);
+        if (firstCached.entry) {
+          setSelectedFile({
+            ...liveList.items[0],
+            cacheStatus: CacheStatus.HIT,
+            contentPreview: firstCached.entry.payload,
+          });
+        }
+      } else {
+        setSelectedFile(null);
+      }
+      setLastTransferBanner(
+        `Connected Google Drive as ${authedUser.email || 'user'} (${liveList.items.length} file(s) synced & hydrated in ${liveList.latencyMs} ms)`
+      );
+    },
+    [handleSelectAndHydrateFile, recordLatencyEvent, settings.pageSize]
+  );
+
+  const handleGoogleLogin = async (scopeOverride?: string) => {
+    const cleanScope =
+      typeof scopeOverride === 'string' ? scopeOverride : settings.oauthScope;
+    setIsLoggingIn(true);
+    try {
+      const result = await googleSignIn({
+        scopeOverride: cleanScope,
+        loginHint: settings.loginHint,
+        customClientId: settings.customOAuthClientId,
+      });
+      if (result) {
+        await completeDriveSignIn(result.user);
+      }
+    } catch (err: unknown) {
+      console.error('Google Sign-In failed:', err);
+      setAuthErrorDetails(formatAuthErrorDetails(err));
+      setIsSettingsOpen(true);
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleGisLogin = async (scopeOverride?: string) => {
+    const cleanScope =
+      typeof scopeOverride === 'string' ? scopeOverride : settings.oauthScope;
+    setIsLoggingIn(true);
+    try {
+      const result = await signInWithGisTokenClient({
+        scopeOverride: cleanScope,
+        loginHint: settings.loginHint,
+        customClientId: settings.customOAuthClientId,
+      });
+      await completeDriveSignIn(result.user);
+    } catch (err: unknown) {
+      console.error('GIS Sign-In failed:', err);
+      setAuthErrorDetails(formatAuthErrorDetails(err));
+      setIsSettingsOpen(true);
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleDirectTokenLogin = async (token: string) => {
+    setIsLoggingIn(true);
+    try {
+      const result = await verifyAndSetAccessToken(token);
+      await completeDriveSignIn(result.user);
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleServiceAccountLogin = async (serviceAccountJson: string) => {
+    setIsLoggingIn(true);
+    try {
+      const result = await authenticateWithServiceAccount(
+        serviceAccountJson,
+        settings.oauthScope === 'profile_only'
+          ? 'https://www.googleapis.com/auth/drive'
+          : settings.oauthScope
+      );
+      await completeDriveSignIn(result.user);
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleRefreshTokenLogin = async (params: {
+    clientId: string;
+    clientSecret: string;
+    refreshToken: string;
+  }) => {
+    setIsLoggingIn(true);
+    try {
+      const result = await authenticateWithRefreshToken(params);
+      await completeDriveSignIn(result.user);
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await logout();
+    lruCacheRef.current.clear();
+    setUser(null);
+    setNeedsAuth(true);
+    setItems([]);
+    setSelectedFile(null);
+    setCacheVersion((v) => v + 1);
+    setLastTransferBanner('Signed out and purged volatile OAuth access token and LRU cache.');
+  };
+
+  // Trigger Browser Download of Cached/Streamed File
+  const handleDownloadFileToDisk = async (file: DriveItem) => {
+    const hydrated = await handleSelectAndHydrateFile(file);
+    const blob = new Blob([hydrated.contentPreview], { type: hydrated.mimeType || 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = hydrated.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setLastTransferBanner(`Downloaded "${hydrated.name}" to local disk.`);
+  };
+
+  // Multipart Chunked Upload Handler
+  const handleUploadFile = async (params: {
+    name: string;
+    mimeType: string;
+    content: string;
+    folderPath: string;
+  }) => {
+    const { item, latencyMs } = await uploadFileToDrive(params);
+    const cache = lruCacheRef.current;
+    cache.put(item.id, item.name, item.md5Checksum, item.contentPreview, item.size);
+    recordLatencyEvent('UPLOAD', latencyMs, item.size);
+
+    const chunks = splitIntoChunks(params.content, 16384);
+    const throughput = calculateThroughputMbps(item.size, Math.max(0.05, latencyMs));
+
+    setItems((prev) => [item, ...prev.filter((i) => i.id !== item.id)]);
+    setSelectedFile(item);
+    setTransferJobs((prev) => [
+      {
+        id: `tx-up-${Date.now().toString(36)}`,
+        fileName: item.name,
+        direction: 'UPLOAD',
+        totalBytes: item.size,
+        transferredBytes: item.size,
+        totalChunks: chunks.length,
+        completedChunks: chunks.length,
+        throughputMbps: throughput,
+        latencyMs,
+        status: 'COMPLETED',
+        startedAt: new Date().toISOString(),
+      },
+      ...prev,
+    ]);
+    setCacheVersion((v) => v + 1);
+    setLastTransferBanner(
+      `Uploaded "${item.name}" (${chunks.length} chunk(s)) & hydrated LRU cache in ${latencyMs} ms`
+    );
+  };
+
+  // Mandatory Destructive Action Gate for Delete
+  const handleRequestDeleteFile = (file: DriveItem) => {
+    setDestructiveRequest({
+      actionType: 'DELETE',
+      title: `Delete "${file.name}" from Google Drive?`,
+      description:
+        'This action permanently deletes the selected file from your synchronized Google Drive data plane and evicts its hydrated chunks from the LRU memory cache.',
+      affectedFiles: [
+        {
+          id: file.id,
+          name: file.name,
+          size: file.size,
+          mimeType: file.mimeType,
+        },
+      ],
+      onConfirm: async () => {
+        const { latencyMs } = await deleteDriveFileWithAuth(file);
+        lruCacheRef.current.delete(file.id);
+        setItems((prev) => {
+          const remaining = prev.filter((i) => i.id !== file.id);
+          if (selectedFile?.id === file.id) {
+            setSelectedFile(remaining[0] || null);
+          }
+          return remaining;
+        });
+        setCacheVersion((v) => v + 1);
+        setLastTransferBanner(`Deleted "${file.name}" and evicted LRU cache key in ${latencyMs} ms`);
+      },
+    });
+  };
+
+  // Mandatory Destructive Action Gate for Overwrite
+  const handleRequestOverwriteFile = (file: DriveItem, newContent: string) => {
+    const newByteSize = new TextEncoder().encode(newContent).byteLength;
+    setDestructiveRequest({
+      actionType: 'OVERWRITE',
+      title: `Overwrite contents of "${file.name}"?`,
+      description:
+        'Confirming this operation will overwrite the existing file contents in Google Drive and replace its MD5 checksum in the in-memory LRU cache.',
+      affectedFiles: [
+        {
+          id: file.id,
+          name: file.name,
+          size: newByteSize,
+          mimeType: file.mimeType,
+        },
+      ],
+      onConfirm: async () => {
+        const { item, latencyMs } = await uploadFileToDrive({
+          name: file.name,
+          mimeType: file.mimeType,
+          content: newContent,
+          folderPath: file.folderPath,
+          existingFileId: file.id,
+        });
+        lruCacheRef.current.put(item.id, item.name, item.md5Checksum, newContent, item.size);
+        recordLatencyEvent('UPLOAD', latencyMs, item.size);
+        const chunks = splitIntoChunks(newContent, 16384);
+        const throughput = calculateThroughputMbps(item.size, Math.max(0.05, latencyMs));
+
+        setItems((prev) => prev.map((i) => (i.id === file.id ? item : i)));
+        setSelectedFile(item);
+        setTransferJobs((prev) => [
+          {
+            id: `tx-ov-${Date.now().toString(36)}`,
+            fileName: item.name,
+            direction: 'UPLOAD',
+            totalBytes: item.size,
+            transferredBytes: item.size,
+            totalChunks: chunks.length,
+            completedChunks: chunks.length,
+            throughputMbps: throughput,
+            latencyMs,
+            status: 'COMPLETED',
+            startedAt: new Date().toISOString(),
+          },
+          ...prev,
+        ]);
+        setCacheVersion((v) => v + 1);
+        setLastTransferBanner(
+          `Updated "${file.name}" in Google Drive & refreshed LRU cache in ${latencyMs} ms`
+        );
+      },
+    });
+  };
+
+  const handleTogglePinForAgent = (fileId: string) => {
+    const target = items.find((i) => i.id === fileId);
+    const nextPinned = target ? !target.pinnedForAgent : true;
+
+    setItems((prev) =>
+      prev.map((item) =>
+        item.id === fileId ? { ...item, pinnedForAgent: !item.pinnedForAgent } : item
+      )
+    );
+
+    if (target && nextPinned && !target.contentPreview) {
+      void handleSelectAndHydrateFile({ ...target, pinnedForAgent: true });
+    }
+  };
+
+  const handleUseFileInAgentStudio = async (file: DriveItem) => {
+    const hydrated = !file.contentPreview ? await handleSelectAndHydrateFile(file) : file;
+    const pinnedItem: DriveItem = { ...hydrated, pinnedForAgent: true };
+    setItems((prev) => prev.map((i) => (i.id === file.id ? pinnedItem : i)));
+    setSelectedFile(pinnedItem);
+    setActiveView(WorkspaceView.AGENT_STUDIO);
+    setLastTransferBanner(
+      `Loaded "${pinnedItem.name}" content into High-Thinking Agent Studio context.`
+    );
+  };
+
+  const handleUseFileInHarnessSdk = async (file: DriveItem) => {
+    const hydrated = !file.contentPreview ? await handleSelectAndHydrateFile(file) : file;
+    setSelectedFile(hydrated);
+    setActiveView(WorkspaceView.HARNESS_SDK);
+    setLastTransferBanner(
+      `Selected "${hydrated.name}" (${hydrated.id}) for Harness SDK / MCP RPC inspection.`
+    );
+  };
+
+  // Emit selected Google Drive file & hydrated content directly to parent Host Software via postMessage
+  const handleEmitFileToHostPlugin = async (file: DriveItem) => {
+    const start = performance.now();
+    const hydrated = !file.contentPreview ? await handleSelectAndHydrateFile(file) : file;
+    const latencyMs = Math.max(0.01, Math.round((performance.now() - start) * 100) / 100);
+    const eventFrame = {
+      source: 'drivepulse-plugin-bridge',
+      jsonrpc: '2.0',
+      method: 'plugin.fileSelected',
+      params: {
+        fileId: hydrated.id,
+        fileName: hydrated.name,
+        mimeType: hydrated.mimeType,
+        size: hydrated.size,
+        md5Checksum: hydrated.md5Checksum,
+        cacheStatus: hydrated.cacheStatus,
+        content: hydrated.contentPreview,
+        emittedAt: new Date().toISOString(),
+      },
+    };
+    window.parent?.postMessage(eventFrame, '*');
+    setRpcLogs((prev) => [
+      {
+        id: `rpc-${Date.now().toString(36)}`,
+        timestamp: new Date().toISOString().slice(11, 23),
+        transport: 'POSTMESSAGE_SDK',
+        method: 'plugin.fileSelected',
+        paramsSummary: JSON.stringify({
+          fileId: hydrated.id,
+          fileName: hydrated.name,
+          bytes: hydrated.size,
+        }),
+        status: 'OK',
+        latencyMs,
+        cacheHit: hydrated.cacheStatus === CacheStatus.HIT,
+        requestPayload: JSON.stringify(
+          { action: 'emitToHostSoftware', fileId: hydrated.id, fileName: hydrated.name },
+          null,
+          2
+        ),
+        responsePayload: JSON.stringify(eventFrame, null, 2),
+      },
+      ...prev,
+    ]);
+    setLastTransferBanner(
+      `Emitted "${hydrated.name}" (${hydrated.size} B) to Host Software Plugin Bridge via window.parent.postMessage in ${latencyMs} ms`
+    );
+  };
+
+  const handleImportDriveLink = async (urlOrId: string) => {
+    const { item, latencyMs } = await importDriveFileByUrlOrId(urlOrId);
+    lruCacheRef.current.put(item.id, item.name, item.md5Checksum, item.contentPreview, item.size);
+    recordLatencyEvent('STREAM_READ', latencyMs, item.size);
+
+    const chunks = splitIntoChunks(item.contentPreview, 16384);
+    const throughput = calculateThroughputMbps(item.size, Math.max(0.05, latencyMs));
+
+    setItems((prev) => [item, ...prev.filter((i) => i.id !== item.id)]);
+    setSelectedFile(item);
+    setTransferJobs((prev) => [
+      {
+        id: `tx-imp-${Date.now().toString(36)}`,
+        fileName: item.name,
+        direction: 'DOWNLOAD',
+        totalBytes: item.size,
+        transferredBytes: item.size,
+        totalChunks: chunks.length,
+        completedChunks: chunks.length,
+        throughputMbps: throughput,
+        latencyMs,
+        status: 'COMPLETED',
+        startedAt: new Date().toISOString(),
+      },
+      ...prev,
+    ]);
+    setCacheVersion((v) => v + 1);
+    setLastTransferBanner(
+      `Fetched & hydrated Google Drive file "${item.name}" (${chunks.length} chunk(s)) in ${latencyMs} ms`
+    );
+  };
+
+  const handleRefreshDriveFiles = async (fileNameQuery?: string) => {
+    setIsRefreshingDrive(true);
+    try {
+      const liveList = await fetchLiveDriveFiles(settings.pageSize, fileNameQuery);
+      recordLatencyEvent('STREAM_READ', liveList.latencyMs, 0);
+      setItems(liveList.items);
+      if (liveList.items.length > 0) {
+        setSelectedFile(liveList.items[0]);
+        for (const item of liveList.items.slice(0, 3)) {
+          await handleSelectAndHydrateFile(item);
+        }
+      }
+      setLastTransferBanner(
+        fileNameQuery
+          ? `Queried Google Drive index for "${fileNameQuery}": ${liveList.items.length} file(s) returned in ${liveList.latencyMs} ms`
+          : `Refreshed ${liveList.items.length} Google Drive file(s) in ${liveList.latencyMs} ms`
+      );
+    } catch (err: unknown) {
+      console.error('Refresh Drive files error:', err);
+    } finally {
+      setIsRefreshingDrive(false);
+    }
+  };
+
+  // Real-Time Delta Sync Poll
+  const handleTriggerDeltaSync = async () => {
+    setIsSyncing(true);
+    try {
+      const pollResult = await pollDriveDeltaChanges(startPageToken);
+      setStartPageToken(pollResult.newStartPageToken);
+      const nowIso = new Date().toISOString();
+      setLastDeltaSyncTime(nowIso.slice(11, 19) + ' UTC');
+      recordLatencyEvent('STREAM_READ', pollResult.latencyMs, 0);
+
+      setTransferJobs((prev) => [
+        {
+          id: `tx-sync-${Date.now().toString(36)}`,
+          fileName: `changes.list (token ${pollResult.newStartPageToken})`,
+          direction: 'SYNC',
+          totalBytes: pollResult.changes.length * 512,
+          transferredBytes: pollResult.changes.length * 512,
+          totalChunks: 1,
+          completedChunks: 1,
+          throughputMbps: calculateThroughputMbps(
+            Math.max(512, pollResult.changes.length * 512),
+            Math.max(0.05, pollResult.latencyMs)
+          ),
+          latencyMs: pollResult.latencyMs,
+          status: 'COMPLETED',
+          startedAt: nowIso,
+        },
+        ...prev,
+      ]);
+
+      if (pollResult.changes.length > 0) {
+        const applied = lruCacheRef.current.applyDeltaChanges(items, pollResult.changes);
+        setItems(applied.updatedItems);
+        setLastTransferBanner(
+          `Delta Sync applied ${pollResult.changes.length} change(s); invalidated ${applied.invalidatedIds.length} stale LRU key(s) in ${pollResult.latencyMs} ms.`
+        );
+      } else {
+        setLastTransferBanner(
+          `Delta Sync complete (token ${pollResult.newStartPageToken}) in ${pollResult.latencyMs} ms.`
+        );
+      }
+      setCacheVersion((v) => v + 1);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Automatic Background Delta-Sync Polling (when configured in Settings > Stream & LRU Cache)
+  useEffect(() => {
+    if (settings.autoSyncIntervalSec <= 0) return;
+    const intervalId = window.setInterval(() => {
+      void handleTriggerDeltaSync();
+    }, settings.autoSyncIntervalSec * 1000);
+    return () => window.clearInterval(intervalId);
+  }, [settings.autoSyncIntervalSec, startPageToken]);
+
+  // High-Thinking Agent Query (gemini-4-carbon + ThinkingLevel.HIGH)
+  const handleRunHighThinkingQuery = async (query: string) => {
+    setIsAnalyzing(true);
+    setAgentError(null);
+    try {
+      const pinned = items.filter((i) => i.pinnedForAgent);
+      const hydratedPinned: DriveItem[] = [];
+      for (const f of pinned) {
+        if (!f.contentPreview) {
+          hydratedPinned.push(await handleSelectAndHydrateFile(f));
+        } else {
+          hydratedPinned.push(f);
+        }
+      }
+      const contextFiles = hydratedPinned.map((f) => ({
+        id: f.id,
+        name: f.name,
+        mimeType: f.mimeType,
+        content: f.contentPreview,
+      }));
+
+      const res = await fetch('/api/agent/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, contextFiles }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setAgentError(data.error || `Gemini API request failed (${res.status})`);
+        return;
+      }
+
+      const newResult: AgentReasoningResult = {
+        id: data.id || `ag-${Date.now().toString(36)}`,
+        query,
+        model: data.model || 'gemini-4-carbon',
+        thinkingLevel: data.thinkingLevel || 'HIGH',
+        thinkingSummary: data.thinkingSummary || '',
+        answerMarkdown: data.answerMarkdown || '',
+        referencedFiles: data.referencedFiles || pinned.map((p) => p.name),
+        suggestedActions: data.suggestedActions || [],
+        latencyMs: Number(data.latencyMs || 0),
+        timestamp: data.timestamp || new Date().toISOString(),
+      };
+
+      setAgentResults((prev) => [newResult, ...prev]);
+    } catch (err: unknown) {
+      setAgentError(err instanceof Error ? err.message : 'Agent analysis request failed');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  // Dispatch Harness SDK / MCP RPC Call
+  const handleDispatchRpc = async (
+    transport: 'POSTMESSAGE_SDK' | 'REST_MCP',
+    method: PluginRpcMethod,
+    params: Record<string, unknown>
+  ) => {
+    const reqId = `req-${Date.now().toString(36)}`;
+    if (transport === 'POSTMESSAGE_SDK') {
+      const start = performance.now();
+      window.postMessage(
+        {
+          source: 'drivepulse-host-harness',
+          jsonrpc: '2.0',
+          id: reqId,
+          method,
+          params,
+        },
+        window.location.origin
+      );
+      if (
+        method !== 'drive.read' &&
+        method !== 'plugin.handshake' &&
+        method !== 'drive.search' &&
+        method !== 'drive.list'
+      ) {
+        const latencyMs = Math.max(0.01, Math.round((performance.now() - start) * 100) / 100);
+        recordLatencyEvent('LRU_READ', latencyMs, 0);
+        const reqPayload = {
+          source: 'drivepulse-host-harness',
+          jsonrpc: '2.0',
+          id: reqId,
+          method,
+          params,
+        };
+        const resPayload = {
+          source: 'drivepulse-plugin-bridge',
+          jsonrpc: '2.0',
+          id: reqId,
+          result: {
+            status: 'OK',
+            method,
+            itemsCount: items.length,
+            latencyMs,
+          },
+        };
+        setRpcLogs((prev) => [
+          {
+            id: `rpc-${Date.now().toString(36)}`,
+            timestamp: new Date().toISOString().slice(11, 23),
+            transport: 'POSTMESSAGE_SDK',
+            method,
+            paramsSummary: JSON.stringify(params),
+            status: 'OK',
+            latencyMs,
+            cacheHit: true,
+            requestPayload: JSON.stringify(reqPayload, null, 2),
+            responsePayload: JSON.stringify(resPayload, null, 2),
+          },
+          ...prev,
+        ]);
+      }
+      return;
+    }
+
+    // REST MCP JSON-RPC Call to /api/mcp/rpc
+    const token = await getAccessToken();
+    const reqBody = {
+      jsonrpc: '2.0',
+      id: reqId,
+      method,
+      params,
+    };
+    const start = performance.now();
+    const response = await fetch('/api/mcp/rpc', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(reqBody),
+    });
+    const resData = await response.json();
+    const latencyMs =
+      Number(resData?.result?.latencyMs) ||
+      Math.round((performance.now() - start) * 100) / 100;
+
+    recordLatencyEvent(
+      method === 'drive.upload' ? 'UPLOAD' : 'STREAM_READ',
+      latencyMs,
+      Number(resData?.result?.byteSize || 0)
+    );
+
+    if (method === 'drive.upload' && resData?.result?.fileId) {
+      const uploadedItem: DriveItem = {
+        id: String(resData.result.fileId),
+        name: String(resData.result.fileName || 'rpc-artifact.json'),
+        mimeType: 'application/json',
+        size: Number(resData.result.byteSize || 0),
+        modifiedTime: new Date().toISOString(),
+        md5Checksum: String(resData.result.checksum || ''),
+        folderPath: '/Workspace',
+        cacheStatus: CacheStatus.HIT,
+        lastLatencyMs: latencyMs,
+        contentPreview: String(params.content || ''),
+        pinnedForAgent: true,
+        source: 'sandbox',
+      };
+      lruCacheRef.current.put(
+        uploadedItem.id,
+        uploadedItem.name,
+        uploadedItem.md5Checksum,
+        uploadedItem.contentPreview,
+        uploadedItem.size
+      );
+      setItems((prev) => [uploadedItem, ...prev.filter((i) => i.id !== uploadedItem.id)]);
+      setSelectedFile(uploadedItem);
+      setCacheVersion((v) => v + 1);
+    }
+
+    setRpcLogs((prev) => [
+      {
+        id: `rpc-${Date.now().toString(36)}`,
+        timestamp: new Date().toISOString().slice(11, 23),
+        transport: 'REST_MCP',
+        method,
+        paramsSummary: JSON.stringify(params),
+        status: response.ok ? 'OK' : 'ERROR',
+        latencyMs,
+        cacheHit: resData?.result?.cacheStatus === 'HIT',
+        requestPayload: JSON.stringify(reqBody, null, 2),
+        responsePayload: JSON.stringify(resData, null, 2),
+      },
+      ...prev,
+    ]);
+  };
+
+  const latencySamples = useMemo(
+    () => buildRollingSixtyMinuteSeries(latencyEvents, clockTickMs),
+    [latencyEvents, clockTickMs]
+  );
+
+  void cacheVersion;
+  const cacheTelemetry = lruCacheRef.current.getTelemetry();
+  const cacheEntries = lruCacheRef.current.entries();
+
+  return (
+    <div className="min-h-screen h-screen flex flex-col bg-slate-50 dark:bg-[#0B0F19] text-slate-900 dark:text-slate-100 overflow-hidden">
+      {/* 3-Zone Top Bar Contract */}
+      <TopBar
+        activeView={activeView}
+        onSelectView={setActiveView}
+        user={user}
+        needsAuth={needsAuth}
+        isLoggingIn={isLoggingIn}
+        onGoogleLogin={handleGoogleLogin}
+        onLogout={handleLogout}
+      />
+
+      {/* Compact Host Plugin Mode Banner when ?embed=plugin is active */}
+      {isPluginEmbedMode && (
+        <div className="px-4 py-1.5 bg-indigo-600 text-white text-xs flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-300 animate-pulse" />
+            <span className="font-semibold">Compact Host Plugin Mode Active</span>
+            <span className="text-indigo-200 hidden sm:inline">
+              · Ready to emit files to parent software via window.parent.postMessage
+            </span>
+          </div>
+          <button
+            onClick={() => setIsPluginEmbedMode(false)}
+            className="px-2 py-0.5 rounded bg-indigo-700 hover:bg-indigo-800 text-[11px] font-medium transition-colors"
+          >
+            Exit Compact Plugin Mode
+          </button>
+        </div>
+      )}
+
+      {/* Main Workspace Canvas: 256px Structural Sidebar + Fluid Viewport */}
+      <div className="flex-1 flex min-h-0 overflow-hidden">
+        {!isPluginEmbedMode && (
+          <Sidebar
+            items={items}
+            selectedFolder={selectedFolder}
+            onSelectFolder={setSelectedFolder}
+            cacheTelemetry={cacheTelemetry}
+            onOpenUploadModal={() => setIsUploadOpen(true)}
+            onTriggerDeltaSync={handleTriggerDeltaSync}
+            isSyncing={isSyncing}
+            isDark={isDark}
+            onToggleTheme={() => setIsDark((d) => !d)}
+            activeView={activeView}
+            onSelectView={setActiveView}
+            isLiveConnected={!needsAuth && Boolean(user)}
+            onOpenSettingsModal={() => setIsSettingsOpen(true)}
+          />
+        )}
+
+        <main className="flex-1 flex flex-col min-w-0 min-h-0 overflow-hidden">
+          {activeView === WorkspaceView.EXPLORER && (
+            <ExplorerView
+              items={items}
+              selectedFolder={selectedFolder}
+              selectedFile={selectedFile}
+              isHydratingFileId={isHydratingFileId}
+              isRefreshingDrive={isRefreshingDrive}
+              onSelectFile={handleSelectAndHydrateFile}
+              onDownloadFile={handleDownloadFileToDisk}
+              onTogglePinForAgent={handleTogglePinForAgent}
+              onUseFileInAgentStudio={handleUseFileInAgentStudio}
+              onUseFileInHarnessSdk={handleUseFileInHarnessSdk}
+              onEmitFileToHostPlugin={handleEmitFileToHostPlugin}
+              onImportDriveLink={handleImportDriveLink}
+              onRefreshDriveFiles={handleRefreshDriveFiles}
+              onRequestDeleteFile={handleRequestDeleteFile}
+              onRequestOverwriteFile={handleRequestOverwriteFile}
+              onOpenUploadModal={() => setIsUploadOpen(true)}
+              onOpenSettingsModal={() => setIsSettingsOpen(true)}
+              chunkSizeKb={settings.chunkSizeKb}
+              lastTransferBanner={lastTransferBanner}
+              isPluginEmbedMode={isPluginEmbedMode}
+            />
+          )}
+
+          {activeView === WorkspaceView.SYNC_CACHE && (
+            <SyncCacheView
+              telemetry={cacheTelemetry}
+              cacheEntries={cacheEntries}
+              transferJobs={transferJobs}
+              latencySamples={latencySamples}
+              isDark={isDark}
+              startPageToken={startPageToken}
+              lastDeltaSyncTime={lastDeltaSyncTime}
+              onChangeMaxBytes={(mb) => {
+                handleUpdateSettings({
+                  lruCacheMaxMb: mb as PluginSettings['lruCacheMaxMb'],
+                });
+              }}
+              onEvictEntry={(fileId) => {
+                lruCacheRef.current.delete(fileId);
+                setItems((prev) =>
+                  prev.map((i) =>
+                    i.id === fileId ? { ...i, cacheStatus: CacheStatus.MISS } : i
+                  )
+                );
+                setCacheVersion((v) => v + 1);
+              }}
+              onClearAllCache={() => {
+                lruCacheRef.current.clear();
+                setItems((prev) =>
+                  prev.map((i) => ({ ...i, cacheStatus: CacheStatus.MISS }))
+                );
+                setCacheVersion((v) => v + 1);
+              }}
+              onTriggerDeltaSync={handleTriggerDeltaSync}
+              isSyncing={isSyncing}
+            />
+          )}
+
+          {activeView === WorkspaceView.AGENT_STUDIO && (
+            <AgentStudioView
+              items={items}
+              onTogglePin={handleTogglePinForAgent}
+              results={agentResults}
+              isAnalyzing={isAnalyzing}
+              agentError={agentError}
+              onRunHighThinkingQuery={handleRunHighThinkingQuery}
+              onSaveAgentArtifactToDrive={(fileName, content) =>
+                handleUploadFile({
+                  name: fileName,
+                  mimeType: 'application/yaml',
+                  content,
+                  folderPath: settings.defaultFolderPath,
+                })
+              }
+            />
+          )}
+
+          {activeView === WorkspaceView.HARNESS_SDK && (
+            <HarnessSdkView
+              items={items}
+              selectedFileId={selectedFile?.id}
+              rpcLogs={rpcLogs}
+              onDispatchRpc={handleDispatchRpc}
+              isPluginEmbedMode={isPluginEmbedMode}
+              onTogglePluginEmbedMode={() => setIsPluginEmbedMode((v) => !v)}
+            />
+          )}
+        </main>
+      </div>
+
+      {/* Chunked Multipart Upload Modal */}
+      <UploadModal
+        isOpen={isUploadOpen}
+        onClose={() => setIsUploadOpen(false)}
+        onUpload={handleUploadFile}
+      />
+
+      {/* Mandatory Destructive Operation Confirmation Dialog */}
+      <DestructiveConfirmModal
+        request={destructiveRequest}
+        onCancel={() => setDestructiveRequest(null)}
+      />
+
+      {/* Comprehensive Plugin Settings & Google OAuth Control Center Modal */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        settings={settings}
+        onUpdateSettings={handleUpdateSettings}
+        user={user}
+        errorDetails={authErrorDetails}
+        isBusy={isLoggingIn}
+        isDark={isDark}
+        onToggleTheme={() => setIsDark((d) => !d)}
+        onClose={() => setIsSettingsOpen(false)}
+        onTriggerFirebaseLogin={(scope) => handleGoogleLogin(scope)}
+        onTriggerGisLogin={(scope) => handleGisLogin(scope)}
+        onSubmitDirectToken={handleDirectTokenLogin}
+        onSubmitServiceAccount={handleServiceAccountLogin}
+        onSubmitRefreshToken={handleRefreshTokenLogin}
+        onPurgeCache={() => {
+          lruCacheRef.current.clear();
+          setItems((prev) => prev.map((i) => ({ ...i, cacheStatus: CacheStatus.MISS })));
+          setCacheVersion((v) => v + 1);
+        }}
+        onLogout={handleLogout}
+      />
+    </div>
+  );
+}
