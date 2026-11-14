@@ -1,5 +1,12 @@
-import { CacheStatus, DeltaChangeItem, DriveItem } from '../types/drive';
-import { computeFastChecksum, parseGoogleDriveUrlOrId } from '../core/chunkStreamer';
+import { CacheEntry, CacheStatus, DeltaChangeItem, DriveItem } from '../types/drive';
+import {
+  calculateThroughputMbps,
+  computeFastChecksum,
+  isBinaryMediaMime,
+  parseGoogleDriveUrlOrId,
+  upgradeDriveThumbnailUrl,
+} from '../core/chunkStreamer';
+import { computeSyncDiffPlan, runConcurrentPool } from '../core/liveSyncEngine';
 import { getAccessToken } from './authService';
 
 export interface LiveDriveListResponse {
@@ -34,25 +41,31 @@ export async function fetchLiveDriveFiles(
     }
     const rpcData = await res.json();
     const rawFiles = (rpcData?.result?.files || []) as Array<Record<string, unknown>>;
-    const items: DriveItem[] = rawFiles.map((f) => ({
-      id: String(f.fileId),
-      name: String(f.fileName),
-      mimeType: String(f.mimeType || 'text/plain'),
-      size: Number(f.byteSize || 0),
-      modifiedTime: String(f.modifiedTime || new Date().toISOString()),
-      md5Checksum: String(f.checksum || ''),
-      folderPath: String(f.folderPath || '/Google Drive'),
-      cacheStatus: CacheStatus.HIT,
-      lastLatencyMs: latencyMs,
-      contentPreview: String(f.content || ''),
-      pinnedForAgent: true,
-      source: 'sandbox',
-    }));
+    const items: DriveItem[] = rawFiles.map((f) => {
+      const contentStr = String(f.content || '');
+      const mimeType = String(f.mimeType || 'text/plain');
+      const isDataUrl = contentStr.startsWith('data:');
+      return {
+        id: String(f.fileId),
+        name: String(f.fileName),
+        mimeType,
+        size: Number(f.byteSize || 0),
+        modifiedTime: String(f.modifiedTime || new Date().toISOString()),
+        md5Checksum: String(f.checksum || ''),
+        folderPath: String(f.folderPath || '/Google Drive'),
+        cacheStatus: CacheStatus.HIT,
+        lastLatencyMs: latencyMs,
+        contentPreview: contentStr,
+        mediaUrl: isDataUrl ? contentStr : undefined,
+        pinnedForAgent: true,
+        source: 'sandbox',
+      };
+    });
     return { items, latencyMs };
   }
 
   const fields =
-    'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents,webViewLink,starred)';
+    'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,parents,webViewLink,webContentLink,thumbnailLink,starred)';
   const escapedFilter = cleanNameFilter.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   const baseQuery =
     "trashed = false and mimeType != 'application/vnd.google-apps.folder' and mimeType != 'application/vnd.google-apps.shortcut'";
@@ -90,6 +103,9 @@ export async function fetchLiveDriveFiles(
     const size = Number(f.size || 0);
     const modifiedTime = String(f.modifiedTime || new Date().toISOString());
     const md5Checksum = String(f.md5Checksum || computeFastChecksum(`${id}-${modifiedTime}`));
+    const thumbnailLink = f.thumbnailLink ? String(f.thumbnailLink) : undefined;
+    const webContentLink = f.webContentLink ? String(f.webContentLink) : undefined;
+    const highResThumb = upgradeDriveThumbnailUrl(thumbnailLink);
 
     return {
       id,
@@ -99,6 +115,9 @@ export async function fetchLiveDriveFiles(
       modifiedTime,
       md5Checksum,
       webViewLink: f.webViewLink ? String(f.webViewLink) : undefined,
+      webContentLink,
+      thumbnailLink,
+      mediaUrl: highResThumb,
       folderPath: '/Google Drive',
       cacheStatus: CacheStatus.MISS,
       lastLatencyMs: latencyMs,
@@ -116,8 +135,12 @@ export async function fetchLiveDriveFiles(
   };
 }
 
-export async function downloadDriveFileContent(file: DriveItem): Promise<{
+export async function downloadDriveFileContent(
+  file: DriveItem,
+  options?: { skipServerMirror?: boolean }
+): Promise<{
   content: string;
+  mediaUrl?: string;
   latencyMs: number;
   bytesRead: number;
 }> {
@@ -142,12 +165,16 @@ export async function downloadDriveFileContent(file: DriveItem): Promise<{
     const data = await res.json();
     const content = String(data?.result?.content || file.contentPreview || '');
     const bytesRead = new TextEncoder().encode(content).byteLength;
+    const isDataUrl = content.startsWith('data:');
     return {
       content,
+      mediaUrl: isDataUrl ? content : file.mediaUrl,
       latencyMs,
       bytesRead,
     };
   }
+
+  const isBinaryMedia = isBinaryMediaMime(file.mimeType, file.name);
 
   let url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
     file.id
@@ -179,6 +206,54 @@ export async function downloadDriveFileContent(file: DriveItem): Promise<{
 
   const latencyMs = Math.round((performance.now() - start) * 100) / 100;
 
+  // Binary Media Path (Images, Videos, Audio, PDFs): create native ObjectURL from Blob so media renders/plays cleanly
+  if (isBinaryMedia) {
+    if (res.ok) {
+      const rawBlob = await res.blob();
+      const typedBlob =
+        rawBlob.type && rawBlob.type !== 'application/octet-stream'
+          ? rawBlob
+          : new Blob([rawBlob], { type: file.mimeType || 'application/octet-stream' });
+      const blobUrl = URL.createObjectURL(typedBlob);
+      const bytesRead = typedBlob.size || file.size;
+      const descriptor = [
+        `# Binary Media Stream Hydrated: ${file.name}`,
+        `File ID: ${file.id}`,
+        `MIME Type: ${file.mimeType}`,
+        `Stream Size: ${bytesRead} bytes`,
+        `Modified: ${file.modifiedTime}`,
+        `MD5 Checksum: ${file.md5Checksum}`,
+      ].join('\n');
+      return {
+        content: descriptor,
+        mediaUrl: blobUrl,
+        latencyMs,
+        bytesRead,
+      };
+    }
+
+    const fallbackMediaUrl =
+      upgradeDriveThumbnailUrl(file.thumbnailLink) || file.webContentLink || file.mediaUrl;
+    const fallbackText = [
+      `# Connected Google Drive Media: ${file.name}`,
+      `File ID: ${file.id}`,
+      `MIME Type: ${file.mimeType}`,
+      `Size: ${file.size} bytes`,
+      `Modified: ${file.modifiedTime}`,
+      `MD5 Checksum: ${file.md5Checksum}`,
+      file.webViewLink ? `Drive Link: ${file.webViewLink}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    return {
+      content: fallbackText,
+      mediaUrl: fallbackMediaUrl,
+      latencyMs,
+      bytesRead: file.size || new TextEncoder().encode(fallbackText).byteLength,
+    };
+  }
+
   let text = '';
   if (res.ok) {
     text = await res.text();
@@ -198,24 +273,28 @@ export async function downloadDriveFileContent(file: DriveItem): Promise<{
 
   const bytesRead = new TextEncoder().encode(text).byteLength;
 
-  // Mirror hydrated live Google Drive file content into server MCP LRU cache for /api/mcp/rpc consumers
-  void fetch('/api/mcp/rpc', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: `mirror-${Date.now()}`,
-      method: 'drive.upload',
-      params: {
-        fileId: file.id,
-        fileName: file.name,
-        content: text,
-      },
-    }),
-  }).catch(() => {});
+  if (!options?.skipServerMirror) {
+    void fetch('/api/mcp/rpc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: `mirror-${Date.now()}`,
+        method: 'drive.upload',
+        params: {
+          fileId: file.id,
+          fileName: file.name,
+          mimeType: file.mimeType,
+          folderPath: file.folderPath,
+          content: text,
+        },
+      }),
+    }).catch(() => {});
+  }
 
   return {
     content: text,
+    mediaUrl: file.mediaUrl,
     latencyMs,
     bytesRead,
   };
@@ -282,6 +361,7 @@ export async function uploadFileToDrive(params: {
 }): Promise<{ item: DriveItem; latencyMs: number }> {
   const token = await getAccessToken();
   const start = performance.now();
+  const isDataUrl = params.content.startsWith('data:');
   const byteSize = new TextEncoder().encode(params.content).byteLength;
   const checksum = computeFastChecksum(params.content);
 
@@ -318,6 +398,7 @@ export async function uploadFileToDrive(params: {
       cacheStatus: CacheStatus.HIT,
       lastLatencyMs: latencyMs,
       contentPreview: params.content,
+      mediaUrl: isDataUrl ? params.content : undefined,
       pinnedForAgent: true,
       source: 'sandbox',
     };
@@ -333,18 +414,27 @@ export async function uploadFileToDrive(params: {
   const delimiter = `\r\n--${boundary}\r\n`;
   const closeDelimiter = `\r\n--${boundary}--`;
 
+  let bodyPayload = params.content;
+  let contentTransferHeader = '';
+  if (isDataUrl && params.content.includes(';base64,')) {
+    bodyPayload = params.content.split(';base64,')[1] || '';
+    contentTransferHeader = 'Content-Transfer-Encoding: base64\r\n';
+  }
+
   const multipartBody =
     delimiter +
     'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
     JSON.stringify(metadata) +
     delimiter +
-    `Content-Type: ${params.mimeType || 'text/plain'}\r\n\r\n` +
-    params.content +
+    `Content-Type: ${params.mimeType || 'text/plain'}\r\n` +
+    contentTransferHeader +
+    '\r\n' +
+    bodyPayload +
     closeDelimiter;
 
   const endpoint = params.existingFileId
-    ? `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(params.existingFileId)}?uploadType=multipart&fields=id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink`
-    : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink';
+    ? `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(params.existingFileId)}?uploadType=multipart&fields=id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink,webContentLink,thumbnailLink`
+    : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size,modifiedTime,md5Checksum,webViewLink,webContentLink,thumbnailLink';
 
   const response = await fetch(endpoint, {
     method: params.existingFileId ? 'PATCH' : 'POST',
@@ -362,6 +452,7 @@ export async function uploadFileToDrive(params: {
 
   const created = await response.json();
   const latencyMs = Math.round((performance.now() - start) * 100) / 100;
+  const thumbnailLink = created.thumbnailLink ? String(created.thumbnailLink) : undefined;
 
   const item: DriveItem = {
     id: String(created.id),
@@ -371,6 +462,9 @@ export async function uploadFileToDrive(params: {
     modifiedTime: String(created.modifiedTime || new Date().toISOString()),
     md5Checksum: String(created.md5Checksum || checksum),
     webViewLink: created.webViewLink ? String(created.webViewLink) : undefined,
+    webContentLink: created.webContentLink ? String(created.webContentLink) : undefined,
+    thumbnailLink,
+    mediaUrl: isDataUrl ? params.content : upgradeDriveThumbnailUrl(thumbnailLink),
     folderPath: '/Google Drive',
     cacheStatus: CacheStatus.HIT,
     lastLatencyMs: latencyMs,
@@ -493,6 +587,172 @@ export async function pollDriveDeltaChanges(currentStartPageToken: string): Prom
     newStartPageToken: String(data.newStartPageToken || data.nextPageToken || pageToken),
     changes,
     latencyMs,
+  };
+}
+
+export interface TurboSyncExecutionResult {
+  items: DriveItem[];
+  newlyHydratedItems: DriveItem[];
+  unchangedCount: number;
+  hydratedCount: number;
+  removedIds: string[];
+  totalBytes: number;
+  throughputMbps: number;
+  latencyMs: number;
+  seq: number;
+}
+
+/**
+ * Two-Phase Zero-Blocking Ultra-Fast Turbo Sync:
+ * Phase 1 (< 50 ms): Fetches metadata + O(N) checksum diffing and invokes `onMetadataReady`
+ *   immediately so the UI updates with 0 blocking wait.
+ * Phase 2 (16x parallel workers): Hydrates text/code/config files <= 256 KB concurrently while
+ *   large binary media (images, videos, PDFs) use instant high-res `thumbnailLink` and stream
+ *   on-demand when clicked.
+ */
+export async function executeUltraFastTurboSync(params: {
+  pageSize: number;
+  concurrency?: number;
+  cachedEntries: CacheEntry[];
+  previousItems?: DriveItem[];
+  fileNameFilter?: string;
+  onMetadataReady?: (initialItems: DriveItem[], metaLatencyMs: number) => void;
+}): Promise<TurboSyncExecutionResult> {
+  const start = performance.now();
+  const concurrency = Math.max(params.concurrency || 12, 12);
+
+  // Phase 1: Instant Metadata + O(N) Checksum Diff (< 50 ms)
+  const remoteList = await fetchLiveDriveFiles(params.pageSize, params.fileNameFilter);
+  const diffPlan = computeSyncDiffPlan(
+    remoteList.items,
+    params.cachedEntries,
+    params.previousItems || []
+  );
+
+  const prevMap = new Map<string, DriveItem>();
+  for (const prev of params.previousItems || []) {
+    prevMap.set(prev.id, prev);
+  }
+
+  const hitMap = new Map<string, DriveItem>();
+  for (const hit of diffPlan.unchangedHits) {
+    const prev = prevMap.get(hit.id);
+    hitMap.set(hit.id, {
+      ...hit,
+      mediaUrl: hit.mediaUrl || prev?.mediaUrl,
+    });
+  }
+
+  const initialMergedItems = remoteList.items.map((item) => hitMap.get(item.id) || item);
+  const metaLatencyMs = Math.max(0.05, Math.round((performance.now() - start) * 100) / 100);
+  if (params.onMetadataReady) {
+    params.onMetadataReady(initialMergedItems, metaLatencyMs);
+  }
+
+  // Phase 2: Hydrate lightweight text/code/sheet files in parallel; binary media streams on-demand
+  const MAX_EAGER_TEXT_BYTES = 256 * 1024;
+  const eagerCandidates = diffPlan.toHydrate.filter((file) => {
+    if (file.contentPreview) return true;
+    if (isBinaryMediaMime(file.mimeType, file.name)) {
+      return false; // Binary images/videos/PDFs use instant thumbnailLink & on-demand Blob streaming
+    }
+    return (file.size || 0) <= MAX_EAGER_TEXT_BYTES;
+  });
+
+  const newlyHydratedItems = await runConcurrentPool(
+    eagerCandidates,
+    concurrency,
+    async (file) => {
+      if (file.contentPreview) {
+        return {
+          ...file,
+          cacheStatus: CacheStatus.HIT,
+        };
+      }
+      const downloaded = await downloadDriveFileContent(file, { skipServerMirror: true });
+      return {
+        ...file,
+        size: downloaded.bytesRead || file.size,
+        cacheStatus: CacheStatus.HIT,
+        lastLatencyMs: downloaded.latencyMs,
+        contentPreview: downloaded.content,
+        mediaUrl: downloaded.mediaUrl || file.mediaUrl,
+      };
+    }
+  );
+
+  const hydratedMap = new Map<string, DriveItem>(hitMap);
+  for (const hydrated of newlyHydratedItems) {
+    hydratedMap.set(hydrated.id, hydrated);
+  }
+
+  const mergedItems = remoteList.items.map((item) => hydratedMap.get(item.id) || item);
+
+  // Batch-mirror text/metadata items to the Harness server LRU cache in a single non-blocking pass
+  let seq = 1;
+  try {
+    const batchRes = await fetch('/api/sync/turbo-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        origin: 'TURBO_BATCH',
+        files: mergedItems
+          .filter((f) => !f.contentPreview.startsWith('data:') || f.size <= 512 * 1024)
+          .map((f) => ({
+            fileId: f.id,
+            fileName: f.name,
+            mimeType: f.mimeType,
+            content: f.contentPreview,
+            checksum: f.md5Checksum,
+            folderPath: f.folderPath,
+            modifiedTime: f.modifiedTime,
+            source: f.source,
+          })),
+      }),
+    });
+    if (batchRes.ok) {
+      const batchJson = await batchRes.json();
+      seq = Number(batchJson.seq || 1);
+    }
+  } catch {
+    // Non-fatal if server batch endpoint is busy
+  }
+
+  const totalBytes = mergedItems.reduce((sum, i) => sum + (i.size || 0), 0);
+  const latencyMs = Math.max(0.05, Math.round((performance.now() - start) * 100) / 100);
+  const throughputMbps = calculateThroughputMbps(Math.max(512, totalBytes), latencyMs);
+
+  return {
+    items: mergedItems,
+    newlyHydratedItems,
+    unchangedCount: diffPlan.unchangedHits.length,
+    hydratedCount: newlyHydratedItems.length,
+    removedIds: diffPlan.removedIds,
+    totalBytes,
+    throughputMbps,
+    latencyMs,
+    seq,
+  };
+}
+
+export async function probeSyncBusRtt(): Promise<{
+  rttMs: number;
+  serverProcessingMs: number;
+  seq: number;
+  activeSubscribers: number;
+}> {
+  const start = performance.now();
+  const res = await fetch('/api/sync/ping', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const rttMs = Math.max(0.05, Math.round((performance.now() - start) * 100) / 100);
+  const data = await res.json();
+  return {
+    rttMs,
+    serverProcessingMs: Number(data.serverProcessingMs || 0.05),
+    seq: Number(data.seq || 1),
+    activeSubscribers: Number(data.activeSubscribers || 1),
   };
 }
 

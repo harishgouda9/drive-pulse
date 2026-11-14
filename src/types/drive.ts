@@ -28,6 +28,9 @@ export interface DriveItem {
   md5Checksum: string;
   parents?: string[];
   webViewLink?: string;
+  webContentLink?: string;
+  thumbnailLink?: string;
+  mediaUrl?: string;
   folderPath: string;
   cacheStatus: CacheStatus;
   lastLatencyMs: number;

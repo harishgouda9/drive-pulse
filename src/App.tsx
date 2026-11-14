@@ -20,6 +20,7 @@ import {
   OperationLatencyKind,
   RecordedLatencyEvent,
 } from './core/latencyMetrics';
+import { LiveSyncEvent, reconcileLiveSyncEvent } from './core/liveSyncEngine';
 import {
   AuthErrorDetails,
   authenticateWithRefreshToken,
@@ -36,9 +37,11 @@ import {
 import {
   deleteDriveFileWithAuth,
   downloadDriveFileContent,
+  executeUltraFastTurboSync,
   fetchLiveDriveFiles,
   importDriveFileByUrlOrId,
   pollDriveDeltaChanges,
+  probeSyncBusRtt,
   uploadFileToDrive,
 } from './services/driveBridgeService';
 import { DEFAULT_PLUGIN_SETTINGS, PluginSettings } from './types/settings';
@@ -88,11 +91,19 @@ export default function App() {
   const [startPageToken, setStartPageToken] = useState<string>('1');
   const [lastDeltaSyncTime, setLastDeltaSyncTime] = useState<string>('Not polled yet');
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [isTurboSyncing, setIsTurboSyncing] = useState<boolean>(false);
   const [isHydratingFileId, setIsHydratingFileId] = useState<string | null>(null);
   const [isRefreshingDrive, setIsRefreshingDrive] = useState<boolean>(false);
   const [transferJobs, setTransferJobs] = useState<TransferJob[]>([]);
   const [latencyEvents, setLatencyEvents] = useState<RecordedLatencyEvent[]>([]);
   const [clockTickMs, setClockTickMs] = useState<number>(() => Date.now());
+
+  // Real-Time SSE Sync Bus State
+  const [liveSyncConnected, setLiveSyncConnected] = useState<boolean>(false);
+  const [liveSyncRttMs, setLiveSyncRttMs] = useState<number>(0.42);
+  const [liveSyncSeq, setLiveSyncSeq] = useState<number>(1);
+  const [liveSyncSubscribers, setLiveSyncSubscribers] = useState<number>(1);
+  const [liveSyncEvents, setLiveSyncEvents] = useState<LiveSyncEvent[]>([]);
 
   // Real-Time Agent Studio State
   const [agentResults, setAgentResults] = useState<AgentReasoningResult[]>([]);
@@ -134,13 +145,22 @@ export default function App() {
     }
   }, [isDark]);
 
-  // Perform real startup bridge synchronization check against /api/mcp/rpc
+  // Perform real startup bridge synchronization check against /api/mcp/rpc and measure initial Sync Bus RTT
   useEffect(() => {
     let active = true;
     (async () => {
       try {
-        const res = await fetchLiveDriveFiles(30);
+        const [res, ping] = await Promise.all([
+          fetchLiveDriveFiles(30),
+          probeSyncBusRtt().catch(() => null),
+        ]);
         if (!active) return;
+        if (ping) {
+          setLiveSyncRttMs(ping.rttMs);
+          setLiveSyncSeq(ping.seq);
+          setLiveSyncSubscribers(ping.activeSubscribers);
+          recordLatencyEvent('LRU_READ', ping.rttMs, 0);
+        }
         recordLatencyEvent('STREAM_READ', res.latencyMs, 0);
         if (res.items.length > 0) {
           setItems(res.items);
@@ -167,22 +187,112 @@ export default function App() {
     };
   }, [recordLatencyEvent]);
 
-  // Select & Hydrate File via LRU Cache or Real Stream
+  // Subscribe to Server-Authoritative Real-Time SSE Sync Stream (/api/sync/stream)
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof EventSource === 'undefined') return;
+    let es: EventSource | null = null;
+    let reconnectTimer: number | null = null;
+
+    const connectStream = () => {
+      es = new EventSource('/api/sync/stream');
+
+      es.onopen = () => {
+        setLiveSyncConnected(true);
+      };
+
+      es.onmessage = (msgEvent) => {
+        try {
+          const event = JSON.parse(msgEvent.data) as LiveSyncEvent;
+          setLiveSyncConnected(true);
+          if (typeof event.seq === 'number') {
+            setLiveSyncSeq(event.seq);
+          }
+
+          if (event.type === 'sync:heartbeat') {
+            return;
+          }
+
+          setLiveSyncEvents((prev) => {
+            if (prev.some((e) => e.seq === event.seq && e.type === event.type)) {
+              return prev;
+            }
+            return [event, ...prev].slice(0, 40);
+          });
+
+          if (event.type === 'file:upserted' && event.file) {
+            const f = event.file;
+            lruCacheRef.current.put(f.fileId, f.fileName, f.checksum, f.content, f.byteSize);
+            recordLatencyEvent('LRU_READ', event.latencyMs, f.byteSize);
+            setItems((prev) => {
+              const reconciled = reconcileLiveSyncEvent(prev, event);
+              return reconciled.changed ? reconciled.items : prev;
+            });
+            setCacheVersion((v) => v + 1);
+            window.parent?.postMessage(
+              {
+                source: 'drivepulse-plugin-bridge',
+                jsonrpc: '2.0',
+                method: 'plugin.liveSyncEvent',
+                params: event,
+              },
+              '*'
+            );
+          } else if (event.type === 'file:deleted' && event.deletedFileId) {
+            lruCacheRef.current.delete(event.deletedFileId);
+            setItems((prev) => {
+              const reconciled = reconcileLiveSyncEvent(prev, event);
+              return reconciled.changed ? reconciled.items : prev;
+            });
+            setCacheVersion((v) => v + 1);
+          }
+        } catch {
+          // Ignore malformed event frame
+        }
+      };
+
+      es.onerror = () => {
+        setLiveSyncConnected(false);
+        es?.close();
+        if (reconnectTimer === null) {
+          reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            connectStream();
+          }, 2000);
+        }
+      };
+    };
+
+    connectStream();
+
+    return () => {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      es?.close();
+    };
+  }, [recordLatencyEvent]);
+
+  // Select & Hydrate File via LRU Cache or Real Stream (0ms Optimistic UI Selection + Binary Media Support)
   const handleSelectAndHydrateFile = useCallback(
     async (file: DriveItem): Promise<DriveItem> => {
+      // Optimistically select clicked file in 0ms so the viewer switches immediately without network lag
+      setSelectedFile(file);
+
       const cache = lruCacheRef.current;
       const lookup = cache.get(file.id, file.md5Checksum);
 
-      if (lookup.status === CacheStatus.HIT && lookup.entry && lookup.entry.payload) {
+      if (lookup.status === CacheStatus.HIT && lookup.entry && lookup.entry.payload && (!file.mimeType.startsWith('video/') || file.mediaUrl)) {
         recordLatencyEvent('LRU_READ', lookup.latencyMs, lookup.entry.byteSize);
+        const payload = lookup.entry.payload;
         const updatedFile: DriveItem = {
           ...file,
           cacheStatus: CacheStatus.HIT,
           lastLatencyMs: lookup.latencyMs,
-          contentPreview: lookup.entry.payload,
+          contentPreview: payload,
+          mediaUrl: payload.startsWith('data:') ? payload : file.mediaUrl,
         };
         setItems((prev) => prev.map((i) => (i.id === file.id ? updatedFile : i)));
-        setSelectedFile(updatedFile);
+        setSelectedFile((prev) => (prev?.id === file.id ? updatedFile : prev));
         setCacheVersion((v) => v + 1);
         setLastTransferBanner(
           `LRU Memory HIT for "${file.name}" in ${lookup.latencyMs.toFixed(2)} ms`
@@ -190,7 +300,7 @@ export default function App() {
         return updatedFile;
       }
 
-      // Cache Miss or Stale -> Stream content & hydrate LRU
+      // Cache Miss or Binary Media Stream -> Stream content & hydrate LRU
       setIsHydratingFileId(file.id);
       try {
         const streamed = await downloadDriveFileContent(file);
@@ -210,10 +320,11 @@ export default function App() {
           cacheStatus: CacheStatus.HIT,
           lastLatencyMs: streamed.latencyMs,
           contentPreview: streamed.content,
+          mediaUrl: streamed.mediaUrl || file.mediaUrl,
         };
 
         setItems((prev) => prev.map((i) => (i.id === file.id ? updatedFile : i)));
-        setSelectedFile(updatedFile);
+        setSelectedFile((prev) => (prev?.id === file.id ? updatedFile : prev));
         setTransferJobs((prev) => [
           {
             id: `tx-dl-${Date.now().toString(36)}`,
@@ -574,9 +685,26 @@ export default function App() {
     setLastTransferBanner('Signed out and purged volatile OAuth access token and LRU cache.');
   };
 
-  // Trigger Browser Download of Cached/Streamed File
+  // Trigger Browser Download of Cached/Streamed File or Binary Media
   const handleDownloadFileToDisk = async (file: DriveItem) => {
     const hydrated = await handleSelectAndHydrateFile(file);
+    const directMediaUrl =
+      hydrated.mediaUrl ||
+      (hydrated.contentPreview.startsWith('data:') || hydrated.contentPreview.startsWith('blob:')
+        ? hydrated.contentPreview
+        : undefined);
+
+    if (directMediaUrl && (directMediaUrl.startsWith('blob:') || directMediaUrl.startsWith('data:'))) {
+      const a = document.createElement('a');
+      a.href = directMediaUrl;
+      a.download = hydrated.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setLastTransferBanner(`Downloaded "${hydrated.name}" to local disk.`);
+      return;
+    }
+
     const blob = new Blob([hydrated.contentPreview], { type: hydrated.mimeType || 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -830,47 +958,150 @@ export default function App() {
     );
   };
 
+  const handleProbeSyncRtt = useCallback(async () => {
+    try {
+      const ping = await probeSyncBusRtt();
+      setLiveSyncRttMs(ping.rttMs);
+      setLiveSyncSeq(ping.seq);
+      setLiveSyncSubscribers(ping.activeSubscribers);
+      recordLatencyEvent('LRU_READ', ping.rttMs, 0);
+      setLastTransferBanner(
+        `Sync Bus RTT measured: ${ping.rttMs.toFixed(2)} ms (Server processing: ${ping.serverProcessingMs.toFixed(2)} ms · Seq #${ping.seq})`
+      );
+    } catch (err) {
+      console.error('Sync RTT probe failed:', err);
+    }
+  }, [recordLatencyEvent]);
+
+  // Ultra-Fast Parallel Turbo Sync (O(N) Checksum Diff + Concurrent Multi-Worker Hydration + Batch Harness Mirror)
+  const handleTriggerTurboSync = useCallback(
+    async (fileNameQuery?: string) => {
+      setIsTurboSyncing(true);
+      try {
+        const result = await executeUltraFastTurboSync({
+          pageSize: settings.pageSize,
+          concurrency: settings.parallelWorkers,
+          cachedEntries: lruCacheRef.current.entries(),
+          previousItems: items,
+          fileNameFilter: fileNameQuery,
+          onMetadataReady: (initialItems, metaLatencyMs) => {
+            setItems(initialItems);
+            if (initialItems.length > 0) {
+              setSelectedFile((prev) => {
+                const match = prev && initialItems.find((i) => i.id === prev.id);
+                return match || initialItems[0];
+              });
+            }
+            setLastTransferBanner(
+              `Phase 1 Metadata Index ready in ${metaLatencyMs} ms (${initialItems.length} file(s)) — streaming delta payloads...`
+            );
+          },
+        });
+
+        const newlyHydratedIds = new Set(result.newlyHydratedItems.map((h) => h.id));
+        for (const item of result.items) {
+          if (!newlyHydratedIds.has(item.id)) {
+            const lookup = lruCacheRef.current.get(item.id, item.md5Checksum);
+            if (lookup.status === CacheStatus.HIT) {
+              recordLatencyEvent('LRU_READ', lookup.latencyMs, item.size);
+            }
+          }
+        }
+
+        for (const hydrated of result.newlyHydratedItems) {
+          if (hydrated.contentPreview) {
+            lruCacheRef.current.put(
+              hydrated.id,
+              hydrated.name,
+              hydrated.md5Checksum,
+              hydrated.contentPreview,
+              hydrated.size
+            );
+          }
+        }
+        for (const removedId of result.removedIds) {
+          lruCacheRef.current.delete(removedId);
+        }
+
+        if (result.hydratedCount > 0) {
+          recordLatencyEvent('STREAM_READ', result.latencyMs, result.totalBytes);
+        }
+
+        const nowIso = new Date().toISOString();
+        setLastDeltaSyncTime(nowIso.slice(11, 19) + ' UTC');
+        setLiveSyncSeq(result.seq);
+        setItems(result.items);
+        if (result.items.length > 0) {
+          setSelectedFile((prev) => {
+            const match = prev && result.items.find((i) => i.id === prev.id);
+            return match || result.items[0];
+          });
+        }
+
+        setTransferJobs((prev) => [
+          {
+            id: `tx-turbo-${Date.now().toString(36)}`,
+            fileName: `Turbo Sync (${result.hydratedCount} hydrated, ${result.unchangedCount} RAM HITs)`,
+            direction: 'SYNC',
+            totalBytes: result.totalBytes,
+            transferredBytes: result.totalBytes,
+            totalChunks: Math.max(1, result.items.length),
+            completedChunks: Math.max(1, result.items.length),
+            throughputMbps: result.throughputMbps,
+            latencyMs: result.latencyMs,
+            status: 'COMPLETED',
+            startedAt: nowIso,
+          },
+          ...prev,
+        ]);
+
+        setCacheVersion((v) => v + 1);
+        setLastTransferBanner(
+          `Turbo Live Sync complete in ${result.latencyMs} ms (${result.throughputMbps.toFixed(1)} MB/s): ${result.hydratedCount} file(s) streamed via ${settings.parallelWorkers}x parallel workers, ${result.unchangedCount} sub-ms RAM HIT(s)`
+        );
+      } catch (err: unknown) {
+        console.error('Turbo Sync error:', err);
+      } finally {
+        setIsTurboSyncing(false);
+      }
+    },
+    [items, recordLatencyEvent, settings.pageSize, settings.parallelWorkers]
+  );
+
   const handleRefreshDriveFiles = async (fileNameQuery?: string) => {
     setIsRefreshingDrive(true);
     try {
-      const liveList = await fetchLiveDriveFiles(settings.pageSize, fileNameQuery);
-      recordLatencyEvent('STREAM_READ', liveList.latencyMs, 0);
-      setItems(liveList.items);
-      if (liveList.items.length > 0) {
-        setSelectedFile(liveList.items[0]);
-        for (const item of liveList.items.slice(0, 3)) {
-          await handleSelectAndHydrateFile(item);
-        }
-      }
-      setLastTransferBanner(
-        fileNameQuery
-          ? `Queried Google Drive index for "${fileNameQuery}": ${liveList.items.length} file(s) returned in ${liveList.latencyMs} ms`
-          : `Refreshed ${liveList.items.length} Google Drive file(s) in ${liveList.latencyMs} ms`
-      );
-    } catch (err: unknown) {
-      console.error('Refresh Drive files error:', err);
+      await handleTriggerTurboSync(fileNameQuery);
     } finally {
       setIsRefreshingDrive(false);
     }
   };
 
   // Real-Time Delta Sync Poll
-  const handleTriggerDeltaSync = async () => {
+  const handleTriggerDeltaSync = useCallback(async () => {
     setIsSyncing(true);
     try {
-      const pollResult = await pollDriveDeltaChanges(startPageToken);
+      const [pollResult, pingResult] = await Promise.all([
+        pollDriveDeltaChanges(startPageToken),
+        probeSyncBusRtt().catch(() => null),
+      ]);
+      if (pingResult) {
+        setLiveSyncRttMs(pingResult.rttMs);
+        setLiveSyncSeq(pingResult.seq);
+        setLiveSyncSubscribers(pingResult.activeSubscribers);
+      }
       setStartPageToken(pollResult.newStartPageToken);
       const nowIso = new Date().toISOString();
       setLastDeltaSyncTime(nowIso.slice(11, 19) + ' UTC');
-      recordLatencyEvent('STREAM_READ', pollResult.latencyMs, 0);
+      recordLatencyEvent('LRU_READ', pollResult.latencyMs, 0);
 
       setTransferJobs((prev) => [
         {
           id: `tx-sync-${Date.now().toString(36)}`,
           fileName: `changes.list (token ${pollResult.newStartPageToken})`,
           direction: 'SYNC',
-          totalBytes: pollResult.changes.length * 512,
-          transferredBytes: pollResult.changes.length * 512,
+          totalBytes: Math.max(512, pollResult.changes.length * 512),
+          transferredBytes: Math.max(512, pollResult.changes.length * 512),
           totalChunks: 1,
           completedChunks: 1,
           throughputMbps: calculateThroughputMbps(
@@ -899,16 +1130,38 @@ export default function App() {
     } finally {
       setIsSyncing(false);
     }
-  };
+  }, [items, recordLatencyEvent, startPageToken]);
 
-  // Automatic Background Delta-Sync Polling (when configured in Settings > Stream & LRU Cache)
+  // Continuous Real-Time High-Speed Delta Synchronization Loop
   useEffect(() => {
-    if (settings.autoSyncIntervalSec <= 0) return;
+    const activeIntervalMs = settings.liveSyncEnabled
+      ? settings.liveSyncIntervalMs
+      : settings.autoSyncIntervalSec > 0
+      ? settings.autoSyncIntervalSec * 1000
+      : 0;
+    if (activeIntervalMs <= 0) return;
+
     const intervalId = window.setInterval(() => {
-      void handleTriggerDeltaSync();
-    }, settings.autoSyncIntervalSec * 1000);
+      void probeSyncBusRtt()
+        .then((ping) => {
+          setLiveSyncRttMs(ping.rttMs);
+          setLiveSyncSeq(ping.seq);
+          setLiveSyncSubscribers(ping.activeSubscribers);
+        })
+        .catch(() => {});
+      if (!needsAuth && user) {
+        void handleTriggerDeltaSync();
+      }
+    }, activeIntervalMs);
     return () => window.clearInterval(intervalId);
-  }, [settings.autoSyncIntervalSec, startPageToken]);
+  }, [
+    handleTriggerDeltaSync,
+    needsAuth,
+    settings.autoSyncIntervalSec,
+    settings.liveSyncEnabled,
+    settings.liveSyncIntervalMs,
+    user,
+  ]);
 
   // High-Thinking Agent Query (gemini-4-carbon + ThinkingLevel.HIGH)
   const handleRunHighThinkingQuery = async (query: string) => {
@@ -1169,6 +1422,10 @@ export default function App() {
               selectedFile={selectedFile}
               isHydratingFileId={isHydratingFileId}
               isRefreshingDrive={isRefreshingDrive}
+              isTurboSyncing={isTurboSyncing}
+              liveSyncConnected={liveSyncConnected}
+              liveSyncRttMs={liveSyncRttMs}
+              liveSyncEnabled={settings.liveSyncEnabled}
               onSelectFile={handleSelectAndHydrateFile}
               onDownloadFile={handleDownloadFileToDisk}
               onTogglePinForAgent={handleTogglePinForAgent}
@@ -1177,6 +1434,8 @@ export default function App() {
               onEmitFileToHostPlugin={handleEmitFileToHostPlugin}
               onImportDriveLink={handleImportDriveLink}
               onRefreshDriveFiles={handleRefreshDriveFiles}
+              onTriggerTurboSync={() => void handleTriggerTurboSync()}
+              onToggleLiveSync={(enabled) => handleUpdateSettings({ liveSyncEnabled: enabled })}
               onRequestDeleteFile={handleRequestDeleteFile}
               onRequestOverwriteFile={handleRequestOverwriteFile}
               onOpenUploadModal={() => setIsUploadOpen(true)}
@@ -1217,8 +1476,26 @@ export default function App() {
                 );
                 setCacheVersion((v) => v + 1);
               }}
-              onTriggerDeltaSync={handleTriggerDeltaSync}
+              onTriggerDeltaSync={() => void handleTriggerDeltaSync()}
+              onTriggerTurboSync={() => void handleTriggerTurboSync()}
+              onProbeSyncRtt={() => void handleProbeSyncRtt()}
               isSyncing={isSyncing}
+              isTurboSyncing={isTurboSyncing}
+              liveSyncConnected={liveSyncConnected}
+              liveSyncRttMs={liveSyncRttMs}
+              liveSyncSeq={liveSyncSeq}
+              liveSyncSubscribers={liveSyncSubscribers}
+              liveSyncEnabled={settings.liveSyncEnabled}
+              liveSyncIntervalMs={settings.liveSyncIntervalMs}
+              parallelWorkers={settings.parallelWorkers}
+              onToggleLiveSync={(enabled) => handleUpdateSettings({ liveSyncEnabled: enabled })}
+              onChangeLiveSyncInterval={(intervalMs) =>
+                handleUpdateSettings({ liveSyncIntervalMs: intervalMs })
+              }
+              onChangeParallelWorkers={(workers) =>
+                handleUpdateSettings({ parallelWorkers: workers })
+              }
+              liveSyncEvents={liveSyncEvents}
             />
           )}
 

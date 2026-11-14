@@ -100,11 +100,123 @@ export function classifyFileCategory(mimeType: string, fileName: string): FileCa
     return FileCategory.CODE;
   }
 
-  if (lowerMime.startsWith('image/') || lowerMime.startsWith('video/') || lowerMime.startsWith('audio/')) {
+  if (
+    lowerMime.startsWith('image/') ||
+    lowerMime.startsWith('video/') ||
+    lowerMime.startsWith('audio/') ||
+    /\.(png|jpe?g|gif|webp|svg|bmp|ico|mp4|webm|mov|avi|mkv|mp3|wav|ogg|m4a)$/i.test(lowerName)
+  ) {
     return FileCategory.MEDIA;
   }
 
   return FileCategory.DOCUMENTS;
+}
+
+export type ViewerMediaKind = 'image' | 'video' | 'audio' | 'pdf' | 'csv' | 'code_text';
+
+export function detectViewerKind(
+  mimeType: string,
+  fileName: string,
+  contentPreview?: string
+): ViewerMediaKind {
+  const lowerMime = (mimeType || '').toLowerCase();
+  const lowerName = (fileName || '').toLowerCase();
+  const trimmedContent = (contentPreview || '').trim();
+
+  if (
+    lowerMime.startsWith('image/') ||
+    /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i.test(lowerName) ||
+    trimmedContent.startsWith('data:image/')
+  ) {
+    return 'image';
+  }
+
+  if (
+    lowerMime.startsWith('video/') ||
+    /\.(mp4|webm|mov|m4v|ogv|avi|mkv)$/i.test(lowerName) ||
+    trimmedContent.startsWith('data:video/')
+  ) {
+    return 'video';
+  }
+
+  if (
+    lowerMime.startsWith('audio/') ||
+    /\.(mp3|wav|ogg|m4a|flac|aac)$/i.test(lowerName) ||
+    trimmedContent.startsWith('data:audio/')
+  ) {
+    return 'audio';
+  }
+
+  if (
+    lowerMime === 'application/pdf' ||
+    lowerName.endsWith('.pdf') ||
+    trimmedContent.startsWith('data:application/pdf')
+  ) {
+    return 'pdf';
+  }
+
+  if (
+    lowerMime.includes('csv') ||
+    lowerMime === 'application/vnd.google-apps.spreadsheet' ||
+    lowerName.endsWith('.csv') ||
+    lowerName.endsWith('.tsv')
+  ) {
+    return 'csv';
+  }
+
+  return 'code_text';
+}
+
+export function isBinaryMediaMime(mimeType: string, fileName: string = ''): boolean {
+  const lowerMime = (mimeType || '').toLowerCase();
+  const lowerName = (fileName || '').toLowerCase();
+  if (lowerMime.includes('svg') || lowerName.endsWith('.svg')) {
+    return false;
+  }
+  const kind = detectViewerKind(mimeType, fileName);
+  return kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'pdf';
+}
+
+export function upgradeDriveThumbnailUrl(thumbnailLink?: string): string | undefined {
+  if (!thumbnailLink) return undefined;
+  return thumbnailLink.replace(/=s\d+(-[a-z0-9]+)?$/i, '=s1600');
+}
+
+export function buildGoogleDriveEmbedUrl(
+  fileId: string,
+  source: 'live_drive' | 'sandbox' | 'harness_rpc' = 'live_drive'
+): string | undefined {
+  if (!fileId || source !== 'live_drive' || fileId.startsWith('drv-')) {
+    return undefined;
+  }
+  return `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/preview`;
+}
+
+export function parseCsvPreviewRows(csvContent: string, maxRows: number = 100): string[][] {
+  if (!csvContent || !csvContent.trim()) return [];
+  const lines = csvContent
+    .trim()
+    .split(/\r\n|\r|\n/)
+    .filter((l) => l.trim().length > 0)
+    .slice(0, maxRows);
+  return lines.map((line) => {
+    const cells: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        inQuotes = !inQuotes;
+      } else if ((ch === ',' || ch === '\t') && !inQuotes) {
+        cells.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    cells.push(current.trim());
+    return cells;
+  });
 }
 
 export type SearchScopeMode = 'filename' | 'all';

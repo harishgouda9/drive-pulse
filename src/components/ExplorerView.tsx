@@ -6,7 +6,6 @@ import {
   Pin,
   Copy,
   Check,
-  Save,
   Zap,
   ExternalLink,
   Upload,
@@ -16,16 +15,24 @@ import {
   Link2,
   X,
   Share2,
+  Maximize2,
+  Eye,
+  Columns,
+  PanelRightOpen,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { CacheStatus, DriveItem, FileCategory } from '../types/drive';
 import {
   computeContentStats,
+  detectViewerKind,
   filterAndSortDriveItems,
   formatBytesTabular,
   SearchScopeMode,
   splitFilenameHighlight,
   splitIntoChunks,
 } from '../core/chunkStreamer';
+import { FileContentRenderer, FileViewerModal } from './FileViewerModal';
 
 interface ExplorerViewProps {
   items: DriveItem[];
@@ -33,6 +40,10 @@ interface ExplorerViewProps {
   selectedFile: DriveItem | null;
   isHydratingFileId?: string | null;
   isRefreshingDrive?: boolean;
+  isTurboSyncing?: boolean;
+  liveSyncConnected?: boolean;
+  liveSyncRttMs?: number;
+  liveSyncEnabled?: boolean;
   isPluginEmbedMode?: boolean;
   onSelectFile: (file: DriveItem) => void;
   onDownloadFile: (file: DriveItem) => void;
@@ -42,6 +53,8 @@ interface ExplorerViewProps {
   onEmitFileToHostPlugin?: (file: DriveItem) => void;
   onImportDriveLink?: (urlOrId: string) => Promise<void>;
   onRefreshDriveFiles?: (fileNameQuery?: string) => Promise<void>;
+  onTriggerTurboSync?: () => void;
+  onToggleLiveSync?: (enabled: boolean) => void;
   onRequestDeleteFile: (file: DriveItem) => void;
   onRequestOverwriteFile: (file: DriveItem, newContent: string) => void;
   onOpenUploadModal: () => void;
@@ -56,6 +69,10 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   selectedFile,
   isHydratingFileId = null,
   isRefreshingDrive = false,
+  isTurboSyncing = false,
+  liveSyncConnected = true,
+  liveSyncRttMs = 0.42,
+  liveSyncEnabled = true,
   isPluginEmbedMode = false,
   onSelectFile,
   onDownloadFile,
@@ -65,6 +82,8 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   onEmitFileToHostPlugin,
   onImportDriveLink,
   onRefreshDriveFiles,
+  onTriggerTurboSync,
+  onToggleLiveSync,
   onRequestDeleteFile,
   onRequestOverwriteFile,
   onOpenUploadModal,
@@ -78,7 +97,11 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   const [category, setCategory] = useState<FileCategory>(FileCategory.ALL);
   const [sortBy, setSortBy] = useState<'name' | 'size' | 'modifiedTime' | 'latency'>('modifiedTime');
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [editingContent, setEditingContent] = useState<string | null>(null);
+
+  // Viewer layout & full-screen modal controls
+  const [layoutMode, setLayoutMode] = useState<'split' | 'wide'>('wide');
+  const [isFullViewerOpen, setIsFullViewerOpen] = useState<boolean>(false);
+  const [showChunkBreakdown, setShowChunkBreakdown] = useState<boolean>(false);
 
   const [driveUrlInput, setDriveUrlInput] = useState('');
   const [isImportingLink, setIsImportingLink] = useState(false);
@@ -122,6 +145,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
     { id: FileCategory.CODE, label: 'Code & Config' },
     { id: FileCategory.DOCUMENTS, label: 'Documents' },
     { id: FileCategory.SPREADSHEETS, label: 'Spreadsheets' },
+    { id: FileCategory.MEDIA, label: 'Images & Videos' },
   ];
 
   const handleCopyContent = (file: DriveItem) => {
@@ -160,7 +184,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
   return (
     <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
       {/* Contextual Top Bar / Real-Time Filename Search & Filter Strip */}
-      <div className="px-6 py-4 bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 space-y-3">
+      <div className="px-6 py-3.5 bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 space-y-2.5 shrink-0">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <h1 className="text-lg font-bold font-display text-slate-900 dark:text-slate-100">
@@ -187,8 +211,91 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
             </div>
           </div>
 
-          {/* Refresh & Sort Controls */}
-          <div className="flex flex-wrap items-center gap-2.5">
+          {/* Live Sync, Turbo Sync, Viewer Layout & Sort Controls */}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Viewer Width / Full Screen Switcher */}
+            <div
+              role="group"
+              aria-label="Viewer Layout Size"
+              className="flex items-center p-0.5 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg"
+            >
+              <button
+                type="button"
+                onClick={() => setLayoutMode('split')}
+                aria-pressed={layoutMode === 'split'}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                  layoutMode === 'split'
+                    ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 font-semibold shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                }`}
+              >
+                <Columns className="w-3.5 h-3.5" />
+                <span>Split</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setLayoutMode('wide')}
+                aria-pressed={layoutMode === 'wide'}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                  layoutMode === 'wide'
+                    ? 'bg-white dark:bg-slate-800 text-blue-600 dark:text-blue-400 font-semibold shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                }`}
+              >
+                <PanelRightOpen className="w-3.5 h-3.5" />
+                <span>Wide Viewer</span>
+              </button>
+              {activeFile && (
+                <button
+                  type="button"
+                  onClick={() => setIsFullViewerOpen(true)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/40 rounded-md transition-colors cursor-pointer"
+                >
+                  <Maximize2 className="w-3.5 h-3.5" />
+                  <span>Full Screen</span>
+                </button>
+              )}
+            </div>
+
+            {onToggleLiveSync && (
+              <button
+                type="button"
+                onClick={() => onToggleLiveSync(!liveSyncEnabled)}
+                title="Toggle continuous ultra-low-latency real-time sync between Google Drive and Harness"
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-mono font-semibold rounded-lg border transition-colors cursor-pointer ${
+                  liveSyncEnabled && liveSyncConnected
+                    ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/60 hover:bg-emerald-100'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    liveSyncEnabled && liveSyncConnected
+                      ? 'bg-emerald-500 animate-pulse'
+                      : 'bg-slate-400'
+                  }`}
+                />
+                <span>
+                  {liveSyncEnabled
+                    ? `LIVE SYNC · ${liveSyncRttMs.toFixed(2)} ms`
+                    : 'LIVE SYNC PAUSED'}
+                </span>
+              </button>
+            )}
+
+            {onTriggerTurboSync && (
+              <button
+                type="button"
+                onClick={onTriggerTurboSync}
+                disabled={isTurboSyncing}
+                title="Run Two-Phase Zero-Blocking 16x Worker Turbo Sync"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 rounded-lg shadow-xs transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <Zap className={`w-3.5 h-3.5 ${isTurboSyncing ? 'animate-bounce' : ''}`} />
+                <span>{isTurboSyncing ? 'Turbo Syncing...' : 'Turbo Live Sync'}</span>
+              </button>
+            )}
+
             {onRefreshDriveFiles && (
               <button
                 type="button"
@@ -197,7 +304,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors cursor-pointer disabled:opacity-50"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingDrive ? 'animate-spin' : ''}`} />
-                <span>{isRefreshingDrive ? 'Syncing Drive...' : 'Refresh Drive Files'}</span>
+                <span>{isRefreshingDrive ? 'Syncing Drive...' : 'Refresh'}</span>
               </button>
             )}
 
@@ -319,7 +426,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
           <div
             role="tablist"
             aria-label="Filter files by category"
-            className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg"
+            className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg overflow-x-auto"
           >
             {categoryTabs.map((tab) => {
               const active = category === tab.id;
@@ -370,12 +477,6 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
               </button>
             </form>
           )}
-
-          <div className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-            <span>Memory LRU Cache Active</span>
-            <span aria-hidden="true" className="mx-2">·</span>
-            <span>Chunk Frame: {chunkSizeKb} KB</span>
-          </div>
         </div>
 
         {importError && (
@@ -385,10 +486,14 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
         )}
       </div>
 
-      {/* Main Split Workspace: High-Density Data Grid + Instant LRU File Inspector */}
+      {/* Main Split Workspace: File Repository List + Wide Universal File & Media Viewer */}
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0 overflow-hidden">
-        {/* Left 7 Columns: High-Density File Table */}
-        <div className="lg:col-span-7 border-r border-slate-200 dark:border-slate-800 overflow-y-auto bg-white dark:bg-[#0B0F19]">
+        {/* Left Columns: High-Density File Table */}
+        <div
+          className={`${
+            layoutMode === 'wide' ? 'lg:col-span-5' : 'lg:col-span-6'
+          } border-r border-slate-200 dark:border-slate-800 overflow-y-auto bg-white dark:bg-[#0B0F19]`}
+        >
           {filteredItems.length === 0 ? (
             <div className="p-12 text-center space-y-3">
               <div className="text-sm font-semibold text-slate-800 dark:text-slate-200">
@@ -399,7 +504,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
               <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
                 {searchQuery.trim()
                   ? 'Clear your filename filter, switch to Filename + Content mode, or query the remote Google Drive index directly.'
-                  : 'Connect your Google Drive account, paste a Google Drive / Docs / Sheets link above, or upload a new artifact directly into the synchronized folder to inspect and use its contents.'}
+                  : 'Connect your Google Drive account, paste a Google Drive / Docs / Sheets link above, or upload a new file, image, or video directly into the synchronized folder.'}
               </p>
               <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
                 {searchQuery || category !== FileCategory.ALL ? (
@@ -430,7 +535,7 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
                   className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors cursor-pointer"
                 >
                   <Upload className="w-3.5 h-3.5" />
-                  <span>Upload First File</span>
+                  <span>Upload File / Media</span>
                 </button>
                 {onOpenSettingsModal && (
                   <button
@@ -447,32 +552,35 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 dark:border-slate-800 text-[11px] font-semibold text-slate-500 dark:text-slate-400 bg-slate-50/70 dark:bg-slate-900/50">
-                  <th className="py-2.5 pl-6 pr-3">File Name & Path</th>
-                  <th className="py-2.5 px-3">Cache State</th>
-                  <th className="py-2.5 px-3 text-right">Size</th>
-                  <th className="py-2.5 px-3 text-right">Read Latency</th>
-                  <th className="py-2.5 pl-3 pr-6 text-right">Actions</th>
+                  <th className="py-2.5 pl-5 pr-3">File Name & Type</th>
+                  <th className="py-2.5 px-2">Cache</th>
+                  <th className="py-2.5 px-2 text-right">Size</th>
+                  <th className="py-2.5 px-2 text-right">Latency</th>
+                  <th className="py-2.5 pl-2 pr-5 text-right">Open / Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200/70 dark:divide-slate-800/70 text-xs">
                 {filteredItems.map((item) => {
                   const isSelected = activeFile?.id === item.id;
-                  const hasContent = Boolean(item.contentPreview);
+                  const hasContent = Boolean(item.contentPreview || item.mediaUrl);
                   const nameSegments = splitFilenameHighlight(item.name, searchQuery);
+                  const kind = detectViewerKind(item.mimeType, item.name);
                   return (
                     <tr
                       key={item.id}
-                      onClick={() => {
-                        setEditingContent(null);
+                      onClick={() => onSelectFile(item)}
+                      onDoubleClick={() => {
                         onSelectFile(item);
+                        setIsFullViewerOpen(true);
                       }}
+                      title="Click to inspect · Double-click to open Full-Screen Viewer"
                       className={`h-11 transition-colors cursor-pointer ${
                         isSelected
-                          ? 'bg-blue-50/80 dark:bg-blue-950/30'
+                          ? 'bg-blue-50/90 dark:bg-blue-950/35'
                           : 'hover:bg-slate-50 dark:hover:bg-slate-900/40'
                       }`}
                     >
-                      <td className="py-2 pl-6 pr-3 max-w-[260px]">
+                      <td className="py-2 pl-5 pr-3 max-w-[230px]">
                         <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
                           {nameSegments.map((seg, idx) =>
                             seg.matched ? (
@@ -488,7 +596,9 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
                           )}
                         </div>
                         <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                          <span>{item.folderPath}</span>
+                          <span className="uppercase font-mono text-[10px] text-blue-600 dark:text-blue-400 font-semibold">
+                            {kind}
+                          </span>
                           <span aria-hidden="true" className="mx-1">·</span>
                           <span>{item.mimeType.replace('application/vnd.google-apps.', 'gsuite/')}</span>
                           <span aria-hidden="true" className="mx-1">·</span>
@@ -499,41 +609,33 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
                                 : 'text-slate-400'
                             }
                           >
-                            {hasContent ? 'Content Ready' : 'Click to Stream'}
+                            {hasContent ? 'Ready' : 'Stream on Click'}
                           </span>
-                          {item.pinnedForAgent && (
-                            <>
-                              <span aria-hidden="true" className="mx-1">·</span>
-                              <span className="text-blue-600 dark:text-blue-400 font-medium">
-                                Agent Context
-                              </span>
-                            </>
-                          )}
                         </div>
                       </td>
 
                       {/* Zero-Pill Unboxed Cache State */}
-                      <td className="py-2 px-3 whitespace-nowrap font-mono text-[11px]">
+                      <td className="py-2 px-2 whitespace-nowrap font-mono text-[11px]">
                         {item.cacheStatus === CacheStatus.HIT ? (
                           <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-                            LRU HIT
+                            HIT
                           </span>
                         ) : item.cacheStatus === CacheStatus.STALE ? (
                           <span className="text-amber-600 dark:text-amber-400 font-medium">
-                            DELTA STALE
+                            STALE
                           </span>
                         ) : (
                           <span className="text-slate-500 dark:text-slate-400">
-                            COLD MISS
+                            MISS
                           </span>
                         )}
                       </td>
 
-                      <td className="py-2 px-3 text-right font-mono tabular-nums text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                      <td className="py-2 px-2 text-right font-mono tabular-nums text-slate-600 dark:text-slate-300 whitespace-nowrap">
                         {formatBytesTabular(item.size)}
                       </td>
 
-                      <td className="py-2 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                      <td className="py-2 px-2 text-right font-mono tabular-nums whitespace-nowrap">
                         <span
                           className={
                             item.lastLatencyMs <= 1.0
@@ -546,10 +648,24 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
                       </td>
 
                       <td
-                        className="py-2 pl-3 pr-6 text-right whitespace-nowrap"
+                        className="py-2 pl-2 pr-5 text-right whitespace-nowrap"
                         onClick={(e) => e.stopPropagation()}
                       >
                         <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onSelectFile(item);
+                              setIsFullViewerOpen(true);
+                            }}
+                            aria-label={`Open ${item.name} in full-screen viewer`}
+                            title="Open Full-Screen File & Media Viewer"
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/50 hover:bg-blue-100 dark:hover:bg-blue-900/60 rounded-md transition-colors cursor-pointer"
+                          >
+                            <Eye className="w-3 h-3" />
+                            <span>View</span>
+                          </button>
+
                           {onEmitFileToHostPlugin && (
                             <button
                               type="button"
@@ -619,40 +735,55 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
           )}
         </div>
 
-        {/* Right 5 Columns: Instant Zero-Latency Stream Inspector */}
-        <div className="lg:col-span-5 bg-slate-50/60 dark:bg-[#111827] flex flex-col min-h-0 overflow-y-auto p-6">
+        {/* Right Columns: Wide Universal File, Image, Video & Code Viewer */}
+        <div
+          className={`${
+            layoutMode === 'wide' ? 'lg:col-span-7' : 'lg:col-span-6'
+          } bg-slate-50/60 dark:bg-[#111827] flex flex-col min-h-0 overflow-y-auto p-5`}
+        >
           {!activeFile ? (
             <div className="m-auto text-center text-xs text-slate-500 dark:text-slate-400">
-              Select any Google Drive file to inspect its cached stream and chunk checksums.
+              Select any Google Drive file, image, or video to open its instant stream viewer.
             </div>
           ) : (
-            <div className="space-y-5">
-              {/* File Header & Unboxed Metadata */}
-              <div className="space-y-1.5 pb-4 border-b border-slate-200 dark:border-slate-800">
-                <div className="flex items-start justify-between gap-3">
+            <div className="flex-1 flex flex-col min-h-0 space-y-3.5">
+              {/* File Header & Prominent Full-Screen Viewer Button */}
+              <div className="space-y-1.5 pb-3 border-b border-slate-200 dark:border-slate-800 shrink-0">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <h2 className="text-base font-bold font-display text-slate-900 dark:text-slate-100 break-all">
                     {activeFile.name}
                   </h2>
-                  {activeFile.webViewLink && (
-                    <a
-                      href={activeFile.webViewLink}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 hover:underline shrink-0"
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsFullViewerOpen(true)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 rounded-lg shadow-xs transition-colors cursor-pointer"
                     >
-                      <span>Open in Drive</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  )}
+                      <Maximize2 className="w-3.5 h-3.5" />
+                      <span>Open Full Screen Viewer</span>
+                    </button>
+
+                    {activeFile.webViewLink && (
+                      <a
+                        href={activeFile.webViewLink}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 rounded-lg hover:underline shrink-0"
+                      >
+                        <span>Drive</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
+                  </div>
                 </div>
 
                 {/* Unboxed Metadata Line (Zero-Pill Discipline) */}
                 <div className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                  <span>{activeFile.mimeType}</span>
+                  <span aria-hidden="true">·</span>
                   <span>{formatBytesTabular(activeFile.size)}</span>
                   <span aria-hidden="true">·</span>
                   <span>{contentStats?.lineCount || 0} lines</span>
-                  <span aria-hidden="true">·</span>
-                  <span>{contentStats?.wordCount || 0} words</span>
                   <span aria-hidden="true">·</span>
                   <span>{activeFile.lastLatencyMs.toFixed(1)} ms read</span>
                   <span aria-hidden="true">·</span>
@@ -670,158 +801,154 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
                 </div>
               </div>
 
-              {/* Action Toolbar: Hydrate + Use Content in Agent Studio / Harness SDK / Host Plugin */}
-              <div className="flex flex-wrap items-center gap-2">
-                {onEmitFileToHostPlugin && (
-                  <button
-                    type="button"
-                    onClick={() => onEmitFileToHostPlugin(activeFile)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors cursor-pointer"
-                  >
-                    <Share2 className="w-3.5 h-3.5" />
-                    <span>Emit to Host Plugin</span>
-                  </button>
-                )}
-
-                {onUseFileInAgentStudio && (
-                  <button
-                    type="button"
-                    onClick={() => onUseFileInAgentStudio(activeFile)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 rounded-lg transition-colors cursor-pointer"
-                  >
-                    <Cpu className="w-3.5 h-3.5" />
-                    <span>Use Content in Agent Studio</span>
-                  </button>
-                )}
-
-                {onUseFileInHarnessSdk && (
-                  <button
-                    type="button"
-                    onClick={() => onUseFileInHarnessSdk(activeFile)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
-                  >
-                    <Terminal className="w-3.5 h-3.5" />
-                    <span>Use in Harness SDK</span>
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  onClick={() => onSelectFile(activeFile)}
-                  disabled={isHydratingFileId === activeFile.id}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
-                >
-                  <Zap className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                  <span>
-                    {isHydratingFileId === activeFile.id
-                      ? 'Streaming from Drive...'
-                      : 'Hydrate Content Stream'}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => onDownloadFile(activeFile)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleCopyContent(activeFile)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
-                >
-                  {copiedId === activeFile.id ? (
-                    <>
-                      <Check className="w-3.5 h-3.5 text-emerald-500" />
-                      <span>Copied</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-3.5 h-3.5" />
-                      <span>Copy Payload</span>
-                    </>
+              {/* Action Toolbar */}
+              <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {onEmitFileToHostPlugin && (
+                    <button
+                      type="button"
+                      onClick={() => onEmitFileToHostPlugin(activeFile)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors cursor-pointer"
+                    >
+                      <Share2 className="w-3.5 h-3.5" />
+                      <span>Emit to Plugin</span>
+                    </button>
                   )}
-                </button>
 
+                  {onUseFileInAgentStudio && (
+                    <button
+                      type="button"
+                      onClick={() => onUseFileInAgentStudio(activeFile)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-slate-800 dark:text-slate-100 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                    >
+                      <Cpu className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                      <span>Agent Studio</span>
+                    </button>
+                  )}
+
+                  {onUseFileInHarnessSdk && (
+                    <button
+                      type="button"
+                      onClick={() => onUseFileInHarnessSdk(activeFile)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                    >
+                      <Terminal className="w-3.5 h-3.5" />
+                      <span>Harness SDK</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => onSelectFile(activeFile)}
+                    disabled={isHydratingFileId === activeFile.id}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <Zap className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                    <span>
+                      {isHydratingFileId === activeFile.id
+                        ? 'Streaming...'
+                        : 'Hydrate Content Stream'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onDownloadFile(activeFile)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Download</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleCopyContent(activeFile)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                  >
+                    {copiedId === activeFile.id ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-500" />
+                        <span>Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copy</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onRequestDeleteFile(activeFile)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-red-600 dark:text-red-400 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Delete</span>
+                  </button>
+                </div>
+
+                {/* Collapsible Chunk Diagnostics Toggle */}
                 <button
                   type="button"
-                  onClick={() => onRequestDeleteFile(activeFile)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-600 dark:text-red-400 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-red-50 dark:hover:bg-red-950/30 rounded-lg transition-colors cursor-pointer"
+                  onClick={() => setShowChunkBreakdown((s) => !s)}
+                  className="inline-flex items-center gap-1 text-[11px] font-mono text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 cursor-pointer"
                 >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>Delete</span>
+                  <span>{chunks.length} chunk frame(s)</span>
+                  {showChunkBreakdown ? (
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  )}
                 </button>
               </div>
 
-              {/* Chunked Stream Frame Breakdown */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    Parallel Chunk Stream Layout
-                  </span>
-                  <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                    {chunks.length} frame(s) verified
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {/* Optional Collapsible Chunked Stream Frame Breakdown */}
+              {showChunkBreakdown && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 shrink-0">
                   {chunks.slice(0, 4).map((c) => (
                     <div
                       key={c.index}
-                      className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-[11px] font-mono tabular-nums flex items-center justify-between gap-2"
+                      className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-[11px] font-mono tabular-nums flex items-center justify-between gap-2"
                     >
-                      <span className="text-slate-700 dark:text-slate-300 whitespace-nowrap shrink-0">
+                      <span className="text-slate-700 dark:text-slate-300">
                         Chunk #{c.index} · {formatBytesTabular(c.byteLength)}
                       </span>
-                      <span className="text-emerald-600 dark:text-emerald-400 whitespace-nowrap shrink-0">
+                      <span className="text-emerald-600 dark:text-emerald-400">
                         crc:{c.checksum}
                       </span>
                     </div>
                   ))}
                 </div>
-              </div>
+              )}
 
-              {/* Live File Content Viewer / Editor */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label
-                    htmlFor="inspector-content-editor"
-                    className="text-xs font-semibold text-slate-800 dark:text-slate-200"
-                  >
-                    Connected Google Drive File Content (Editable with Confirmation Gate)
-                  </label>
-                  {editingContent !== null && editingContent !== activeFile.contentPreview && (
-                    <button
-                      type="button"
-                      onClick={() => onRequestOverwriteFile(activeFile, editingContent)}
-                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-500 rounded-md transition-colors cursor-pointer"
-                    >
-                      <Save className="w-3 h-3" />
-                      <span>Sync Overwrite to Drive</span>
-                    </button>
-                  )}
-                </div>
-
-                <textarea
-                  id="inspector-content-editor"
-                  rows={13}
-                  value={editingContent !== null ? editingContent : activeFile.contentPreview}
-                  onChange={(e) => setEditingContent(e.target.value)}
-                  placeholder={
-                    isHydratingFileId === activeFile.id
-                      ? 'Streaming live file content from Google Drive...'
-                      : 'Click "Hydrate Content Stream" to stream the live file content from Google Drive...'
-                  }
-                  className="w-full p-3.5 text-xs font-mono leading-relaxed bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-600"
-                />
-              </div>
+              {/* Universal Rich Content & Media Renderer (Images, Videos, Audio, PDF, CSV Grid, Code/Text) */}
+              <FileContentRenderer
+                file={activeFile}
+                isHydrating={isHydratingFileId === activeFile.id}
+                onHydrate={onSelectFile}
+                onRequestOverwriteFile={onRequestOverwriteFile}
+                onOpenFullScreen={() => setIsFullViewerOpen(true)}
+                isFullScreenModal={false}
+              />
             </div>
           )}
         </div>
       </div>
+
+      {/* Dedicated Full-Screen / Theater Universal File & Media Viewer Modal */}
+      <FileViewerModal
+        file={isFullViewerOpen ? activeFile : null}
+        items={filteredItems.length > 0 ? filteredItems : items}
+        isHydratingFileId={isHydratingFileId}
+        onClose={() => setIsFullViewerOpen(false)}
+        onSelectFile={onSelectFile}
+        onDownloadFile={onDownloadFile}
+        onRequestOverwriteFile={onRequestOverwriteFile}
+        onUseFileInAgentStudio={onUseFileInAgentStudio}
+        onUseFileInHarnessSdk={onUseFileInHarnessSdk}
+        onEmitFileToHostPlugin={onEmitFileToHostPlugin}
+      />
     </div>
   );
 };
-

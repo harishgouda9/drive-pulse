@@ -8,7 +8,8 @@ export type PluginRpcMethod =
   | 'drive.search'
   | 'drive.read'
   | 'drive.upload'
-  | 'drive.deltaSync';
+  | 'drive.deltaSync'
+  | 'drive.turboSync';
 
 interface HarnessSdkViewProps {
   items: DriveItem[];
@@ -138,15 +139,18 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
   "mcpServers": {
     "drivepulse-google-drive": {
       "url": "${originUrl}/api/mcp/rpc",
+      "liveSyncStreamUrl": "${originUrl}/api/sync/stream",
+      "turboBatchUrl": "${originUrl}/api/sync/turbo-batch",
       "manifestUrl": "${originUrl}/api/plugin/manifest.json",
-      "transport": "http-jsonrpc",
+      "transport": "http-jsonrpc+sse",
       "capabilities": [
         "plugin.handshake",
         "drive.list",
         "drive.search",
         "drive.read",
         "drive.upload",
-        "drive.deltaSync"
+        "drive.deltaSync",
+        "drive.turboSync"
       ]
     }
   }
@@ -241,6 +245,7 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
               className="w-full px-3 py-2 text-xs font-mono bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
             >
               <option value="plugin.handshake">plugin.handshake (Verify Plugin Status)</option>
+              <option value="drive.turboSync">drive.turboSync (Ultra-Fast Parallel Sync)</option>
               <option value="drive.search">drive.search (Instant Filename Search)</option>
               <option value="drive.list">drive.list (List Mounted Metadata)</option>
               <option value="drive.read">drive.read (Sub-ms LRU Read)</option>

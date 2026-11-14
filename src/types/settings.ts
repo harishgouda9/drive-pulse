@@ -21,6 +21,9 @@ export interface PluginSettings {
   chunkSizeKb: 16 | 32 | 64 | 128 | 256;
   lruCacheMaxMb: 32 | 64 | 128 | 256 | 512 | 1024;
   autoSyncIntervalSec: 0 | 15 | 30 | 60;
+  liveSyncEnabled: boolean;
+  liveSyncIntervalMs: 1500 | 3000 | 5000 | 10000;
+  parallelWorkers: 4 | 8 | 16;
   pageSize: 15 | 30 | 50 | 100;
   defaultFolderPath: string;
   requireDestructiveConfirm: boolean;
@@ -34,6 +37,9 @@ export const DEFAULT_PLUGIN_SETTINGS: PluginSettings = {
   chunkSizeKb: 64,
   lruCacheMaxMb: 128,
   autoSyncIntervalSec: 0,
+  liveSyncEnabled: true,
+  liveSyncIntervalMs: 3000,
+  parallelWorkers: 8,
   pageSize: 30,
   defaultFolderPath: '/Google Drive',
   requireDestructiveConfirm: true,
