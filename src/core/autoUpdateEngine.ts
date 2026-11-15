@@ -170,3 +170,99 @@ export function buildHarnessUpdatePostMessage(
     },
   };
 }
+
+export interface HarnessPluginIconDescriptor {
+  pluginId: string;
+  title: string;
+  tooltip: string;
+  iconUrl: string;
+  position: 'activity-bar-left' | 'sidebar-dock-right' | 'top-toolbar';
+  badgeCount: number;
+  version: string;
+  buildHash: string;
+  autoUpdateEnabled: boolean;
+  screenShareActive: boolean;
+  sidebarWidthPx: number;
+  embedSidebarUrl: string;
+  registeredAt: string;
+}
+
+export interface HarnessSidebarScreenPayload {
+  pluginId: string;
+  version: string;
+  buildHash: string;
+  autoUpdateStatus: string;
+  activeView: string;
+  selectedFolder: string;
+  totalFiles: number;
+  cacheHitRatioPercent: number;
+  usedCacheBytes: number;
+  liveSyncRttMs: number;
+  activeFile: {
+    id: string;
+    name: string;
+    mimeType: string;
+    size: number;
+    folderPath: string;
+    cacheStatus: string;
+    contentSnippet: string;
+  } | null;
+  emittedAt: string;
+}
+
+/**
+ * Builds the JSON-RPC 2.0 frame that registers/creates the DrivePulse Plugin Icon
+ * inside a connected Host Harness's activity bar or dock.
+ */
+export function buildHarnessRegisterIconFrame(params: {
+  version: string;
+  buildHash: string;
+  badgeCount: number;
+  autoUpdateEnabled: boolean;
+  screenShareActive: boolean;
+  position?: 'activity-bar-left' | 'sidebar-dock-right' | 'top-toolbar';
+  originUrl?: string;
+}): {
+  source: 'drivepulse-plugin-bridge';
+  jsonrpc: '2.0';
+  method: 'plugin.registerIcon';
+  params: HarnessPluginIconDescriptor;
+} {
+  const origin = (params.originUrl || '').replace(/\/$/, '');
+  return {
+    source: 'drivepulse-plugin-bridge',
+    jsonrpc: '2.0',
+    method: 'plugin.registerIcon',
+    params: {
+      pluginId: 'io.drivepulse.harness.bridge',
+      title: 'DrivePulse',
+      tooltip: `DrivePulse Google Drive Bridge (v${params.version} · Auto-Update ${
+        params.autoUpdateEnabled ? 'ON' : 'OFF'
+      })`,
+      iconUrl: `${origin}/icon.svg`,
+      position: params.position || 'sidebar-dock-right',
+      badgeCount: Math.max(0, params.badgeCount),
+      version: params.version,
+      buildHash: params.buildHash,
+      autoUpdateEnabled: params.autoUpdateEnabled,
+      screenShareActive: params.screenShareActive,
+      sidebarWidthPx: 380,
+      embedSidebarUrl: `${origin}/?embed=plugin&dock=sidebar`,
+      registeredAt: new Date().toISOString(),
+    },
+  };
+}
+
+/**
+ * Builds the JSON-RPC 2.0 frame that shares/streams the live DrivePulse screen state
+ * into the connected Host Harness sidebar.
+ */
+export function buildHarnessShareScreenFrame(payload: HarnessSidebarScreenPayload) {
+  return {
+    source: 'drivepulse-plugin-bridge',
+    jsonrpc: '2.0',
+    method: 'plugin.shareScreen',
+    params: payload,
+  };
+}
+

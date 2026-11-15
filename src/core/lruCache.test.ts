@@ -510,8 +510,10 @@ test('virtualScrollEngine computes O(1) virtualized window slices, filters match
   assert.equal(targetScroll, (500 - 1) * 24 - (480 - 24) / 2);
 });
 
-test('autoUpdateEngine compares semver, increments patch releases, evaluates autonomous desktop & Harness update decisions, and builds JSON-RPC 2.0 OTA frames', async () => {
+test('autoUpdateEngine compares semver, increments patch releases, evaluates autonomous desktop & Harness update decisions, and builds JSON-RPC 2.0 OTA, icon, and screen-share frames', async () => {
   const {
+    buildHarnessRegisterIconFrame,
+    buildHarnessShareScreenFrame,
     buildHarnessUpdatePostMessage,
     bumpPatchVersion,
     compareSemver,
@@ -563,5 +565,149 @@ test('autoUpdateEngine compares semver, increments patch releases, evaluates aut
   assert.equal(rpcFrame.params.previousVersion, '2.5.0');
   assert.equal(rpcFrame.params.version, '2.5.1');
   assert.equal(rpcFrame.params.status, 'AUTO_APPLIED');
+
+  const iconFrame = buildHarnessRegisterIconFrame({
+    version: '2.5.1',
+    buildHash: 'b-2510-ota',
+    badgeCount: 4,
+    autoUpdateEnabled: true,
+    screenShareActive: true,
+    originUrl: 'http://localhost:3000',
+  });
+  assert.equal(iconFrame.method, 'plugin.registerIcon');
+  assert.equal(iconFrame.params.iconUrl, 'http://localhost:3000/icon.svg');
+  assert.equal(iconFrame.params.badgeCount, 4);
+  assert.equal(iconFrame.params.screenShareActive, true);
+
+  const screenFrame = buildHarnessShareScreenFrame({
+    pluginId: 'io.drivepulse.harness.bridge',
+    version: '2.5.1',
+    buildHash: 'b-2510-ota',
+    autoUpdateStatus: 'UP_TO_DATE',
+    activeView: 'EXPLORER',
+    selectedFolder: '/Google Drive/Engineering',
+    totalFiles: 4,
+    cacheHitRatioPercent: 95,
+    usedCacheBytes: 4096,
+    liveSyncRttMs: 0.35,
+    activeFile: null,
+    emittedAt: '2026-11-15T02:45:00.000Z',
+  });
+  assert.equal(screenFrame.method, 'plugin.shareScreen');
+  assert.equal(screenFrame.params.selectedFolder, '/Google Drive/Engineering');
+  assert.equal(screenFrame.params.version, '2.5.1');
 });
+
+test('folderTreeEngine extracts nested folder paths from Drive metadata, builds multi-level trees with recursive counts, and filters parent directories', async () => {
+  const {
+    buildFolderTree,
+    collectAllTreeFolderPaths,
+    collectAncestorPaths,
+    extractFolderPathFromDriveMetadata,
+    matchesFolderHierarchy,
+    normalizeFolderPath,
+  } = await import('./folderTreeEngine');
+
+  assert.equal(normalizeFolderPath('Engineering/Pipelines/'), '/Engineering/Pipelines');
+  assert.deepEqual(collectAncestorPaths('/Google Drive/Engineering/Pipelines'), [
+    '/Google Drive',
+    '/Google Drive/Engineering',
+    '/Google Drive/Engineering/Pipelines',
+  ]);
+  assert.equal(
+    matchesFolderHierarchy('/Google Drive/Engineering/Pipelines', '/Google Drive/Engineering'),
+    true
+  );
+  assert.equal(
+    matchesFolderHierarchy('/Google Drive/Analytics', '/Google Drive/Engineering'),
+    false
+  );
+
+  // Extract from parent folder map chain
+  const fromParents = extractFolderPathFromDriveMetadata({
+    name: 'pipeline.yaml',
+    mimeType: 'application/yaml',
+    parents: ['fld-2'],
+    folderMap: {
+      'fld-1': { id: 'fld-1', name: 'Engineering' },
+      'fld-2': { id: 'fld-2', name: 'Pipelines', parentId: 'fld-1' },
+    },
+  });
+  assert.equal(fromParents, '/Google Drive/Engineering/Pipelines');
+
+  // Extract from MIME metadata when at Drive root
+  const fromMime = extractFolderPathFromDriveMetadata({
+    name: 'architecture.png',
+    mimeType: 'image/png',
+  });
+  assert.equal(fromMime, '/Google Drive/Media Assets/Images');
+
+  const sampleItems: DriveItem[] = [
+    {
+      id: 'f1',
+      name: 'deploy.yaml',
+      mimeType: 'application/yaml',
+      size: 1000,
+      modifiedTime: '2026-11-15T01:00:00Z',
+      md5Checksum: 'm1',
+      folderPath: '/Google Drive/Engineering/Pipelines',
+      cacheStatus: CacheStatus.HIT,
+      lastLatencyMs: 0.2,
+      contentPreview: 'stages: [build]',
+      source: 'live_drive',
+    },
+    {
+      id: 'f2',
+      name: 'config.json',
+      mimeType: 'application/json',
+      size: 500,
+      modifiedTime: '2026-11-15T01:05:00Z',
+      md5Checksum: 'm2',
+      folderPath: '/Google Drive/Engineering/JSON Configs',
+      cacheStatus: CacheStatus.HIT,
+      lastLatencyMs: 0.2,
+      contentPreview: '{"ok":true}',
+      source: 'live_drive',
+    },
+    {
+      id: 'f3',
+      name: 'metrics.csv',
+      mimeType: 'text/csv',
+      size: 2500,
+      modifiedTime: '2026-11-15T01:10:00Z',
+      md5Checksum: 'm3',
+      folderPath: '/Google Drive/Analytics/Spreadsheets',
+      cacheStatus: CacheStatus.HIT,
+      lastLatencyMs: 0.2,
+      contentPreview: 'a,b\n1,2',
+      source: 'live_drive',
+    },
+  ];
+
+  const tree = buildFolderTree(sampleItems);
+  assert.equal(tree.length, 1);
+  assert.equal(tree[0].fullPath, '/Google Drive');
+  assert.equal(tree[0].totalFileCount, 3);
+  assert.equal(tree[0].totalBytes, 4000);
+  assert.equal(tree[0].children.length, 2); // Analytics, Engineering
+
+  const engNode = tree[0].children.find((c) => c.name === 'Engineering');
+  assert.ok(engNode);
+  assert.equal(engNode.totalFileCount, 2);
+  assert.equal(engNode.children.length, 2); // JSON Configs, Pipelines
+
+  const allPaths = collectAllTreeFolderPaths(tree);
+  assert.equal(allPaths.includes('/Google Drive/Engineering/Pipelines'), true);
+
+  // Selecting parent folder '/Google Drive/Engineering' returns both nested Engineering files
+  const filteredEng = filterAndSortDriveItems(
+    sampleItems,
+    '',
+    FileCategory.ALL,
+    '/Google Drive/Engineering',
+    'name'
+  );
+  assert.equal(filteredEng.length, 2);
+});
+
 

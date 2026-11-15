@@ -9,6 +9,7 @@ import { DriveLruCache } from './src/core/lruCache';
 import { calculateThroughputMbps, computeFastChecksum } from './src/core/chunkStreamer';
 import { LiveSyncEvent, LiveSyncFilePayload } from './src/core/liveSyncEngine';
 import {
+  buildHarnessRegisterIconFrame,
   bumpPatchVersion,
   SoftwareReleaseManifest,
   UpdateChannel,
@@ -801,6 +802,69 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
     }
   });
 
+  // Universal 1-Line Host Harness Plugin Loader Script (Creates Plugin Icon, Shares Sidebar Screen, & Auto-Updates via SSE)
+  app.get('/plugin-loader.js', (req: Request, res: Response) => {
+    const origin = `${req.protocol}://${req.get('host')}`;
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.send(`(function() {
+  if (window.__DRIVEPULSE_HARNESS_PLUGIN_LOADED__) return;
+  window.__DRIVEPULSE_HARNESS_PLUGIN_LOADED__ = true;
+  var ORIGIN = ${JSON.stringify(origin)};
+  var activeVersion = ${JSON.stringify(currentSoftwareRelease.version)};
+  var isSidebarOpen = false;
+
+  // 1. Create DrivePulse Plugin Icon in Host Harness Activity Bar / Sidebar Dock
+  var dockBtn = document.createElement('button');
+  dockBtn.id = 'drivepulse-harness-plugin-icon';
+  dockBtn.title = 'DrivePulse Google Drive Plugin (v' + activeVersion + ') — Click to Share Sidebar Screen';
+  dockBtn.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:99999;display:flex;align-items:center;gap:8px;padding:8px 12px;background:#0f172a;color:#f8fafc;border:1px solid #3b82f6;border-radius:10px;font-family:monospace;font-size:12px;cursor:pointer;box-shadow:0 10px 25px rgba(0,0,0,0.25);';
+  dockBtn.innerHTML = '<img src="' + ORIGIN + '/icon.svg" width="18" height="18" alt="DrivePulse" />' +
+    '<span id="dp-plugin-label">DrivePulse · v' + activeVersion + '</span>';
+  document.body.appendChild(dockBtn);
+
+  // 2. Create Shared Sidebar Screen Container in Host Harness
+  var drawer = document.createElement('aside');
+  drawer.id = 'drivepulse-harness-sidebar-drawer';
+  drawer.style.cssText = 'position:fixed;top:0;right:0;bottom:0;width:400px;z-index:99998;background:#ffffff;border-left:1px solid #cbd5e1;box-shadow:-8px 0 30px rgba(0,0,0,0.18);transform:translateX(100%);transition:transform 180ms ease;display:flex;flex-direction:column;';
+  var iframe = document.createElement('iframe');
+  iframe.src = ORIGIN + '/?embed=plugin&dock=sidebar';
+  iframe.style.cssText = 'width:100%;height:100%;border:0;flex:1;';
+  iframe.allow = 'clipboard-read; clipboard-write';
+  drawer.appendChild(iframe);
+  document.body.appendChild(drawer);
+
+  dockBtn.addEventListener('click', function() {
+    isSidebarOpen = !isSidebarOpen;
+    drawer.style.transform = isSidebarOpen ? 'translateX(0)' : 'translateX(100%)';
+  });
+
+  // 3. Autonomous Self-Update Listener via Real-Time SSE Stream
+  try {
+    var es = new EventSource(ORIGIN + '/api/sync/stream');
+    es.onmessage = function(ev) {
+      try {
+        var data = JSON.parse(ev.data);
+        if (data && data.release && data.release.version && data.release.version !== activeVersion) {
+          activeVersion = data.release.version;
+          var lbl = document.getElementById('dp-plugin-label');
+          if (lbl) lbl.textContent = 'DrivePulse · v' + activeVersion + ' (Auto-Updated)';
+          dockBtn.title = 'DrivePulse Google Drive Plugin (v' + activeVersion + ') — Auto-Updated Live';
+          if (iframe.contentWindow) {
+            iframe.contentWindow.postMessage({
+              source: 'drivepulse-host-harness',
+              jsonrpc: '2.0',
+              method: 'plugin.checkUpdate',
+              params: { release: data.release }
+            }, '*');
+          }
+        }
+      } catch (e) {}
+    };
+  } catch (e) {}
+})();`);
+  });
+
   // Universal Plugin Manifest for Harness CI/CD, IDP, MCP Clients & Host Software
   app.get('/api/plugin/manifest.json', (req: Request, res: Response) => {
     const origin = `${req.protocol}://${req.get('host')}`;
@@ -811,8 +875,11 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
       version: currentSoftwareRelease.version,
       buildHash: currentSoftwareRelease.buildHash,
       release: currentSoftwareRelease,
+      iconUrl: `${origin}/icon.svg`,
+      sidebarScreenShareSupported: true,
+      autoUpdateSupported: true,
       description:
-        'Ultra-low-latency Google Drive data plane plugin with in-memory LRU caching, 64KB chunked streaming, real-time filename search, OTA auto-updates, and bidirectional Web SDK / MCP JSON-RPC interfaces for Harness pipelines, AI agents, and host software.',
+        'Ultra-low-latency Google Drive data plane plugin that creates its own activity bar icon in host Harnesses, shares its live workspace screen in the sidebar, and autonomously self-updates over SSE and JSON-RPC.',
       endpoints: {
         mcpRpc: `${origin}/api/mcp/rpc`,
         liveSyncStream: `${origin}/api/sync/stream`,
@@ -824,10 +891,14 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
         serviceAccountAuth: `${origin}/api/auth/service-account`,
         agentAnalyze: `${origin}/api/agent/analyze`,
         embedUrl: `${origin}/?embed=plugin`,
+        embedSidebarUrl: `${origin}/?embed=plugin&dock=sidebar`,
+        pluginLoaderJs: `${origin}/plugin-loader.js`,
       },
       transports: ['REST_MCP_JSON_RPC', 'WEB_SDK_POSTMESSAGE', 'SSE_REALTIME_STREAM'],
       supportedMethods: [
         'plugin.handshake',
+        'plugin.registerIcon',
+        'plugin.shareScreen',
         'plugin.checkUpdate',
         'plugin.pushUpdate',
         'drive.list',
@@ -848,6 +919,7 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
   app.post('/api/mcp/rpc', async (req: Request, res: Response) => {
     const start = performance.now();
     const authHeader = req.headers.authorization;
+    const origin = `${req.protocol}://${req.get('host')}`;
     const { id = 'rpc-1', method, params = {} } = req.body as {
       jsonrpc?: string;
       id?: string | number;
@@ -876,10 +948,14 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
             version: currentSoftwareRelease.version,
             buildHash: currentSoftwareRelease.buildHash,
             release: currentSoftwareRelease,
+            iconUrl: `${origin}/icon.svg`,
+            sidebarEmbedUrl: `${origin}/?embed=plugin&dock=sidebar`,
             status: 'READY',
             mountedFileCount: entries.length,
             supportedMethods: [
               'plugin.handshake',
+              'plugin.registerIcon',
+              'plugin.shareScreen',
               'plugin.checkUpdate',
               'plugin.pushUpdate',
               'drive.list',
@@ -891,6 +967,58 @@ Provide a deep architectural synthesis, root-cause or cross-file insights, and c
               'drive.turboSync',
             ],
             cacheTelemetry: serverCache.getTelemetry(),
+            latencyMs,
+            cacheStatus: 'HIT',
+          },
+        });
+        return;
+      }
+
+      if (method === 'plugin.registerIcon') {
+        const entries = serverCache.entries();
+        const latencyMs = Math.max(0.05, Math.round((performance.now() - start) * 100) / 100);
+        const iconFrame = buildHarnessRegisterIconFrame({
+          version: currentSoftwareRelease.version,
+          buildHash: currentSoftwareRelease.buildHash,
+          badgeCount: typeof params.badgeCount === 'number' ? params.badgeCount : entries.length,
+          autoUpdateEnabled: true,
+          screenShareActive: Boolean(params.screenShareActive ?? true),
+          position:
+            (params.position as 'activity-bar-left' | 'sidebar-dock-right' | 'top-toolbar') ||
+            'sidebar-dock-right',
+          originUrl: origin,
+        });
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            status: 'ICON_REGISTERED_IN_HARNESS',
+            iconDescriptor: iconFrame.params,
+            latencyMs,
+            cacheStatus: 'HIT',
+          },
+        });
+        return;
+      }
+
+      if (method === 'plugin.shareScreen') {
+        const entries = serverCache.entries();
+        const telemetry = serverCache.getTelemetry();
+        const latencyMs = Math.max(0.05, Math.round((performance.now() - start) * 100) / 100);
+        res.json({
+          jsonrpc: '2.0',
+          id,
+          result: {
+            status: 'SIDEBAR_SCREEN_SHARED',
+            pluginId: 'io.drivepulse.harness.bridge',
+            version: currentSoftwareRelease.version,
+            buildHash: currentSoftwareRelease.buildHash,
+            selectedFolder: String(params.selectedFolder || 'ALL'),
+            activeFileName: String(params.activeFileName || entries[0]?.fileName || 'None'),
+            mountedFileCount: entries.length,
+            cacheHitRatioPercent: telemetry.hitRatioPercent,
+            usedCacheBytes: telemetry.usedBytes,
+            sidebarEmbedUrl: `${origin}/?embed=plugin&dock=sidebar`,
             latencyMs,
             cacheStatus: 'HIT',
           },

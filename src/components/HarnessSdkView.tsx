@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { Terminal, Play, Copy, Check, ExternalLink, Layers } from 'lucide-react';
+import { Terminal, Play, Copy, Check, ExternalLink, Layers, MonitorUp, Sparkles } from 'lucide-react';
 import { DriveItem, HarnessRpcLog } from '../types/drive';
 
 export type PluginRpcMethod =
   | 'plugin.handshake'
+  | 'plugin.registerIcon'
+  | 'plugin.shareScreen'
   | 'plugin.checkUpdate'
   | 'plugin.pushUpdate'
   | 'drive.list'
@@ -18,6 +20,10 @@ interface HarnessSdkViewProps {
   selectedFileId?: string;
   isPluginEmbedMode?: boolean;
   onTogglePluginEmbedMode?: () => void;
+  isHarnessIconCreated?: boolean;
+  isScreenSharedAtSidebar?: boolean;
+  onCreateHarnessPluginIcon?: () => void;
+  onToggleShareScreenAtSidebar?: () => void;
   rpcLogs: HarnessRpcLog[];
   onDispatchRpc: (
     transport: 'POSTMESSAGE_SDK' | 'REST_MCP',
@@ -31,6 +37,10 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
   selectedFileId,
   isPluginEmbedMode = false,
   onTogglePluginEmbedMode,
+  isHarnessIconCreated = true,
+  isScreenSharedAtSidebar = false,
+  onCreateHarnessPluginIcon,
+  onToggleShareScreenAtSidebar,
   rpcLogs,
   onDispatchRpc,
 }) => {
@@ -40,7 +50,9 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
   );
   const [targetFileId, setTargetFileId] = useState<string>(selectedFileId || items[0]?.id || '');
   const [searchQueryParam, setSearchQueryParam] = useState<string>('');
-  const [integrationTab, setIntegrationTab] = useState<'HARNESS_PIPELINE' | 'WEB_SDK_IFRAME' | 'MCP_AGENT'>('HARNESS_PIPELINE');
+  const [integrationTab, setIntegrationTab] = useState<
+    'HARNESS_PIPELINE' | 'PLUGIN_ICON_LOADER' | 'WEB_SDK_IFRAME' | 'MCP_AGENT'
+  >('PLUGIN_ICON_LOADER');
   const [copiedSnippet, setCopiedSnippet] = useState(false);
   const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
 
@@ -69,6 +81,17 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
           }
         : method === 'drive.deltaSync'
         ? { pageToken: '1' }
+        : method === 'plugin.registerIcon'
+        ? {
+            position: 'sidebar-dock-right',
+            badgeCount: items.length,
+            screenShareActive: true,
+          }
+        : method === 'plugin.shareScreen'
+        ? {
+            selectedFolder: 'ALL',
+            activeFileName: items[0]?.name || 'None',
+          }
         : method === 'plugin.pushUpdate'
         ? {
             channel: 'stable',
@@ -87,6 +110,10 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
       ? { query: searchQueryParam.trim() || 'spec', scope: 'filename' }
       : method === 'drive.deltaSync'
       ? { pageToken: '1' }
+      : method === 'plugin.registerIcon'
+      ? { position: 'sidebar-dock-right', badgeCount: items.length, screenShareActive: true }
+      : method === 'plugin.shareScreen'
+      ? { selectedFolder: 'ALL', activeFileName: items[0]?.name || 'None' }
       : method === 'plugin.pushUpdate'
       ? { channel: 'stable', changelog: ['Automated Harness CI/CD OTA release'] }
       : {};
@@ -94,7 +121,30 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
   const originUrl = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
 
   const integrationBlueprint =
-    integrationTab === 'HARNESS_PIPELINE'
+    integrationTab === 'PLUGIN_ICON_LOADER'
+      ? `<!-- Install DrivePulse as an Auto-Updating Plugin in Any Harness / Host Software -->
+<!-- Automatically creates its Plugin Icon, shares its screen at the Sidebar, and auto-updates via SSE -->
+<script src="${originUrl}/plugin-loader.js" async></script>
+
+<script>
+  // Listen for live Plugin Icon registration, Sidebar Screen Share frames, and OTA Self-Updates
+  window.addEventListener('message', (event) => {
+    if (event.data?.source !== 'drivepulse-plugin-bridge') return;
+
+    switch (event.data.method) {
+      case 'plugin.registerIcon':
+        console.log('DrivePulse created its Plugin Icon in Harness:', event.data.params);
+        break;
+      case 'plugin.shareScreen':
+        console.log('DrivePulse shared its live Sidebar Screen state:', event.data.params);
+        break;
+      case 'plugin.autoUpdate':
+        console.log('DrivePulse auto-updated itself to v' + event.data.params.version, event.data.params);
+        break;
+    }
+  });
+</script>`
+      : integrationTab === 'HARNESS_PIPELINE'
       ? `# Harness CI/CD & IDP Pipeline Step Plugin Configuration
 - step:
     type: Http
@@ -196,6 +246,43 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
+            {onCreateHarnessPluginIcon && (
+              <button
+                type="button"
+                onClick={onCreateHarnessPluginIcon}
+                className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
+                  isHarnessIconCreated
+                    ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                    : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>
+                  {isHarnessIconCreated ? 'Harness Plugin Icon Active' : 'Create Plugin Icon in Harness'}
+                </span>
+              </button>
+            )}
+
+            {onToggleShareScreenAtSidebar && (
+              <button
+                type="button"
+                onClick={onToggleShareScreenAtSidebar}
+                aria-pressed={isScreenSharedAtSidebar}
+                className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
+                  isScreenSharedAtSidebar
+                    ? 'bg-indigo-600 text-white border-indigo-600 hover:bg-indigo-500'
+                    : 'bg-white dark:bg-slate-800 text-indigo-600 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800 hover:bg-indigo-50'
+                }`}
+              >
+                <MonitorUp className="w-3.5 h-3.5" />
+                <span>
+                  {isScreenSharedAtSidebar
+                    ? 'Sharing Screen at Sidebar (Active)'
+                    : 'Share Screen at Sidebar'}
+                </span>
+              </button>
+            )}
+
             <a
               href="/api/plugin/manifest.json"
               target="_blank"
@@ -263,6 +350,8 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
               className="w-full px-3 py-2 text-xs font-mono bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
             >
               <option value="plugin.handshake">plugin.handshake (Verify Plugin Status)</option>
+              <option value="plugin.registerIcon">plugin.registerIcon (Create Icon in Host Harness)</option>
+              <option value="plugin.shareScreen">plugin.shareScreen (Share Screen at Harness Sidebar)</option>
               <option value="plugin.checkUpdate">plugin.checkUpdate (Check OTA Release)</option>
               <option value="plugin.pushUpdate">plugin.pushUpdate (Push Auto-Update to Desktop & Harness)</option>
               <option value="drive.turboSync">drive.turboSync (Ultra-Fast Parallel Sync)</option>
@@ -322,8 +411,21 @@ export const HarnessSdkView: React.FC<HarnessSdkViewProps> = ({
             <div
               role="tablist"
               aria-label="Plugin Integration Blueprints"
-              className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg"
+              className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-lg"
             >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={integrationTab === 'PLUGIN_ICON_LOADER'}
+                onClick={() => setIntegrationTab('PLUGIN_ICON_LOADER')}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                  integrationTab === 'PLUGIN_ICON_LOADER'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                Harness Icon &amp; Sidebar Auto-Loader
+              </button>
               <button
                 type="button"
                 role="tab"

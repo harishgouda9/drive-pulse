@@ -1,4 +1,5 @@
 import { DriveItem, FileCategory } from '../types/drive';
+import { matchesFolderHierarchy } from './folderTreeEngine';
 
 export interface ChunkDescriptor {
   index: number;
@@ -232,7 +233,7 @@ export function filterAndSortDriveItems(
   const normalizedQuery = query.trim().toLowerCase();
 
   const filtered = items.filter((item) => {
-    if (folderFilter && folderFilter !== 'ALL' && item.folderPath !== folderFilter) {
+    if (!matchesFolderHierarchy(item.folderPath, folderFilter)) {
       return false;
     }
     if (category !== FileCategory.ALL && classifyFileCategory(item.mimeType, item.name) !== category) {

@@ -54,6 +54,11 @@ import { HarnessSdkView, PluginRpcMethod } from './components/HarnessSdkView';
 import { UploadModal } from './components/UploadModal';
 import { DestructiveConfirmModal } from './components/DestructiveConfirmModal';
 import { SettingsModal, SettingsTabId } from './components/SettingsModal';
+import { HarnessPluginDock } from './components/HarnessPluginDock';
+import {
+  buildHarnessRegisterIconFrame,
+  buildHarnessShareScreenFrame,
+} from './core/autoUpdateEngine';
 import { useAutoUpdater } from './hooks/useAutoUpdater';
 
 export default function App() {
@@ -69,6 +74,13 @@ export default function App() {
   const [isPluginEmbedMode, setIsPluginEmbedMode] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     return new URLSearchParams(window.location.search).get('embed') === 'plugin';
+  });
+
+  // Installed Harness Plugin Activity Icon & Shared Sidebar Screen State
+  const [isHarnessIconCreated, setIsHarnessIconCreated] = useState<boolean>(true);
+  const [isScreenSharedAtSidebar, setIsScreenSharedAtSidebar] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('dock') === 'sidebar';
   });
 
   // Plugin Settings State
@@ -97,8 +109,19 @@ export default function App() {
     checkIntervalSec: settings.autoUpdateCheckIntervalSec,
     onUpdateApplied: (entry) => {
       setLastTransferBanner(
-        `Auto-Updated Desktop & Connected Harness from v${entry.fromVersion} to v${entry.toVersion} (${entry.buildHash}) — ${entry.changelog[0] || 'OTA release applied'}`
+        `Auto-Updated Desktop & Connected Harness Plugin Icon/Sidebar from v${entry.fromVersion} to v${entry.toVersion} (${entry.buildHash}) — ${entry.changelog[0] || 'OTA release applied'}`
       );
+      if (typeof window !== 'undefined') {
+        const iconFrame = buildHarnessRegisterIconFrame({
+          version: entry.toVersion,
+          buildHash: entry.buildHash,
+          badgeCount: items.length,
+          autoUpdateEnabled: settings.autoUpdateEnabled,
+          screenShareActive: isScreenSharedAtSidebar,
+          originUrl: window.location.origin,
+        });
+        window.parent?.postMessage(iconFrame, '*');
+      }
     },
   });
 
@@ -955,6 +978,129 @@ export default function App() {
     );
   };
 
+  // Create & Register DrivePulse Plugin Icon in Host Harness Activity Bar
+  const handleCreateHarnessPluginIcon = useCallback(() => {
+    const start = performance.now();
+    setIsHarnessIconCreated(true);
+    const originUrl = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
+    const iconFrame = buildHarnessRegisterIconFrame({
+      version: autoUpdater.currentVersion,
+      buildHash: autoUpdater.currentBuildHash,
+      badgeCount: items.length,
+      autoUpdateEnabled: settings.autoUpdateEnabled,
+      screenShareActive: isScreenSharedAtSidebar,
+      originUrl,
+    });
+    window.parent?.postMessage(iconFrame, '*');
+    const latencyMs = Math.max(0.01, Math.round((performance.now() - start) * 100) / 100);
+    setRpcLogs((prev) => [
+      {
+        id: `rpc-${Date.now().toString(36)}`,
+        timestamp: new Date().toISOString().slice(11, 23),
+        transport: 'POSTMESSAGE_SDK',
+        method: 'plugin.registerIcon',
+        paramsSummary: JSON.stringify({
+          version: autoUpdater.currentVersion,
+          badgeCount: items.length,
+        }),
+        status: 'OK',
+        latencyMs,
+        cacheHit: true,
+        requestPayload: JSON.stringify(
+          { action: 'createHarnessPluginIcon', version: autoUpdater.currentVersion },
+          null,
+          2
+        ),
+        responsePayload: JSON.stringify(iconFrame, null, 2),
+      },
+      ...prev,
+    ]);
+    setLastTransferBanner(
+      `Created DrivePulse Plugin Icon (v${autoUpdater.currentVersion}) in Host Harness Dock in ${latencyMs} ms`
+    );
+  }, [
+    autoUpdater.currentBuildHash,
+    autoUpdater.currentVersion,
+    isScreenSharedAtSidebar,
+    items.length,
+    settings.autoUpdateEnabled,
+  ]);
+
+  // Share DrivePulse Screen at Connected Harness Sidebar in Real Time
+  const handleToggleShareScreenAtSidebar = useCallback(() => {
+    const start = performance.now();
+    const nextShared = !isScreenSharedAtSidebar;
+    setIsScreenSharedAtSidebar(nextShared);
+    setIsHarnessIconCreated(true);
+
+    const telemetry = lruCacheRef.current.getTelemetry();
+    const active = selectedFile || items[0] || null;
+    const screenFrame = buildHarnessShareScreenFrame({
+      pluginId: 'io.drivepulse.harness.bridge',
+      version: autoUpdater.currentVersion,
+      buildHash: autoUpdater.currentBuildHash,
+      autoUpdateStatus: autoUpdater.status,
+      activeView,
+      selectedFolder,
+      totalFiles: items.length,
+      cacheHitRatioPercent: telemetry.hitRatioPercent,
+      usedCacheBytes: telemetry.usedBytes,
+      liveSyncRttMs,
+      activeFile: active
+        ? {
+            id: active.id,
+            name: active.name,
+            mimeType: active.mimeType,
+            size: active.size,
+            folderPath: active.folderPath,
+            cacheStatus: active.cacheStatus,
+            contentSnippet: (active.contentPreview || '').slice(0, 400),
+          }
+        : null,
+      emittedAt: new Date().toISOString(),
+    });
+    window.parent?.postMessage(screenFrame, '*');
+    const latencyMs = Math.max(0.01, Math.round((performance.now() - start) * 100) / 100);
+    setRpcLogs((prev) => [
+      {
+        id: `rpc-${Date.now().toString(36)}`,
+        timestamp: new Date().toISOString().slice(11, 23),
+        transport: 'POSTMESSAGE_SDK',
+        method: 'plugin.shareScreen',
+        paramsSummary: JSON.stringify({
+          shared: nextShared,
+          selectedFolder,
+          version: autoUpdater.currentVersion,
+        }),
+        status: 'OK',
+        latencyMs,
+        cacheHit: true,
+        requestPayload: JSON.stringify(
+          { action: 'shareScreenAtSidebar', shared: nextShared, selectedFolder },
+          null,
+          2
+        ),
+        responsePayload: JSON.stringify(screenFrame, null, 2),
+      },
+      ...prev,
+    ]);
+    setLastTransferBanner(
+      nextShared
+        ? `Sharing DrivePulse live screen at Host Harness Sidebar (v${autoUpdater.currentVersion} · Auto-Update ON)`
+        : 'Closed Host Harness Sidebar Screen Share (Plugin Icon remains active in Host Dock).'
+    );
+  }, [
+    activeView,
+    autoUpdater.currentBuildHash,
+    autoUpdater.currentVersion,
+    autoUpdater.status,
+    isScreenSharedAtSidebar,
+    items,
+    liveSyncRttMs,
+    selectedFile,
+    selectedFolder,
+  ]);
+
   const handleImportDriveLink = async (urlOrId: string) => {
     const { item, latencyMs } = await importDriveFileByUrlOrId(urlOrId);
     lruCacheRef.current.put(item.id, item.name, item.md5Checksum, item.contentPreview, item.size);
@@ -1450,6 +1596,8 @@ export default function App() {
             items={items}
             selectedFolder={selectedFolder}
             onSelectFolder={setSelectedFolder}
+            selectedFile={selectedFile}
+            onSelectFile={handleSelectAndHydrateFile}
             cacheTelemetry={cacheTelemetry}
             onOpenUploadModal={() => setIsUploadOpen(true)}
             onTriggerDeltaSync={handleTriggerDeltaSync}
@@ -1460,6 +1608,11 @@ export default function App() {
             onSelectView={setActiveView}
             isLiveConnected={!needsAuth && Boolean(user)}
             onOpenSettingsModal={() => setIsSettingsOpen(true)}
+            currentVersion={autoUpdater.currentVersion}
+            isHarnessIconCreated={isHarnessIconCreated}
+            isScreenSharedAtSidebar={isScreenSharedAtSidebar}
+            onCreateHarnessPluginIcon={handleCreateHarnessPluginIcon}
+            onToggleShareScreenAtSidebar={handleToggleShareScreenAtSidebar}
           />
         )}
 
@@ -1468,6 +1621,7 @@ export default function App() {
             <ExplorerView
               items={items}
               selectedFolder={selectedFolder}
+              onSelectFolder={setSelectedFolder}
               selectedFile={selectedFile}
               isHydratingFileId={isHydratingFileId}
               isRefreshingDrive={isRefreshingDrive}
@@ -1575,9 +1729,42 @@ export default function App() {
               onDispatchRpc={handleDispatchRpc}
               isPluginEmbedMode={isPluginEmbedMode}
               onTogglePluginEmbedMode={() => setIsPluginEmbedMode((v) => !v)}
+              isHarnessIconCreated={isHarnessIconCreated}
+              isScreenSharedAtSidebar={isScreenSharedAtSidebar}
+              onCreateHarnessPluginIcon={handleCreateHarnessPluginIcon}
+              onToggleShareScreenAtSidebar={handleToggleShareScreenAtSidebar}
             />
           )}
         </main>
+
+        {/* Installed Host Harness Plugin Activity Bar Icon & Shared Sidebar Screen */}
+        <HarnessPluginDock
+          isIconCreated={isHarnessIconCreated}
+          isScreenSharedAtSidebar={isScreenSharedAtSidebar}
+          onCreatePluginIcon={handleCreateHarnessPluginIcon}
+          onToggleSidebarScreenShare={handleToggleShareScreenAtSidebar}
+          currentVersion={autoUpdater.currentVersion}
+          currentBuildHash={autoUpdater.currentBuildHash}
+          updateStatus={autoUpdater.status}
+          autoUpdateEnabled={settings.autoUpdateEnabled}
+          updateHistory={autoUpdater.updateHistory}
+          onPushSelfUpdate={async () => {
+            await autoUpdater.pushSoftwareUpdateOta({
+              bumpType: 'patch',
+              channel: settings.autoUpdateChannel,
+              changelog: [
+                'Autonomous self-update triggered from installed Harness Sidebar Plugin',
+              ],
+            });
+          }}
+          items={items}
+          selectedFolder={selectedFolder}
+          selectedFile={selectedFile}
+          onSelectFile={handleSelectAndHydrateFile}
+          onEmitFileToHostPlugin={handleEmitFileToHostPlugin}
+          cacheTelemetry={cacheTelemetry}
+          liveSyncRttMs={liveSyncRttMs}
+        />
       </div>
 
       {/* Chunked Multipart Upload Modal */}

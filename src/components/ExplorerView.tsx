@@ -33,10 +33,12 @@ import {
   splitIntoChunks,
 } from '../core/chunkStreamer';
 import { FileContentRenderer, FileViewerModal } from './FileViewerModal';
+import { collectAncestorPaths } from '../core/folderTreeEngine';
 
 interface ExplorerViewProps {
   items: DriveItem[];
   selectedFolder: string;
+  onSelectFolder?: (folder: string) => void;
   selectedFile: DriveItem | null;
   isHydratingFileId?: string | null;
   isRefreshingDrive?: boolean;
@@ -66,6 +68,7 @@ interface ExplorerViewProps {
 export const ExplorerView: React.FC<ExplorerViewProps> = ({
   items,
   selectedFolder,
+  onSelectFolder,
   selectedFile,
   isHydratingFileId = null,
   isRefreshingDrive = false,
@@ -192,9 +195,52 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
                 ? 'DrivePulse Harness Plugin — Synchronized Data Plane'
                 : 'Google Drive Synchronized Data Plane'}
             </h1>
-            <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              <span>Scope: {selectedFolder === 'ALL' ? 'All Mounted Directories' : selectedFolder}</span>
-              <span aria-hidden="true" className="mx-1.5">·</span>
+            <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 flex flex-wrap items-center gap-1">
+              <span>Scope:</span>
+              {selectedFolder === 'ALL' ? (
+                <span className="font-medium text-slate-700 dark:text-slate-300">
+                  All Mounted Directories
+                </span>
+              ) : (
+                <nav
+                  aria-label="Active Folder Breadcrumb"
+                  data-testid="explorer-folder-breadcrumb"
+                  className="inline-flex flex-wrap items-center gap-1"
+                >
+                  <button
+                    type="button"
+                    onClick={() => onSelectFolder?.('ALL')}
+                    className="hover:text-blue-600 dark:hover:text-blue-400 hover:underline cursor-pointer"
+                  >
+                    All Directories
+                  </button>
+                  {collectAncestorPaths(selectedFolder).map((ancestorPath) => {
+                    const segName = ancestorPath.split('/').filter(Boolean).pop() || ancestorPath;
+                    const isCurrent = ancestorPath === selectedFolder;
+                    return (
+                      <React.Fragment key={ancestorPath}>
+                        <span aria-hidden="true" className="text-slate-400">
+                          /
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onSelectFolder?.(ancestorPath)}
+                          className={`cursor-pointer ${
+                            isCurrent
+                              ? 'font-semibold text-blue-600 dark:text-blue-400'
+                              : 'hover:text-blue-600 dark:hover:text-blue-400 hover:underline'
+                          }`}
+                        >
+                          {segName}
+                        </button>
+                      </React.Fragment>
+                    );
+                  })}
+                </nav>
+              )}
+              <span aria-hidden="true" className="mx-1">
+                ·
+              </span>
               <span className="font-mono tabular-nums">
                 {searchQuery.trim()
                   ? `${filteredItems.length} of ${items.length} file(s) matched`
@@ -202,7 +248,9 @@ export const ExplorerView: React.FC<ExplorerViewProps> = ({
               </span>
               {lastTransferBanner && (
                 <>
-                  <span aria-hidden="true" className="mx-1.5">·</span>
+                  <span aria-hidden="true" className="mx-1">
+                    ·
+                  </span>
                   <span className="text-emerald-600 dark:text-emerald-400 font-medium">
                     {lastTransferBanner}
                   </span>

@@ -7,6 +7,11 @@ import {
   upgradeDriveThumbnailUrl,
 } from '../core/chunkStreamer';
 import { computeSyncDiffPlan, runConcurrentPool } from '../core/liveSyncEngine';
+import {
+  DriveFolderLookupEntry,
+  extractFolderPathFromDriveMetadata,
+  normalizeFolderPath,
+} from '../core/folderTreeEngine';
 import { getAccessToken } from './authService';
 
 export interface LiveDriveListResponse {
@@ -52,7 +57,11 @@ export async function fetchLiveDriveFiles(
         size: Number(f.byteSize || 0),
         modifiedTime: String(f.modifiedTime || new Date().toISOString()),
         md5Checksum: String(f.checksum || ''),
-        folderPath: String(f.folderPath || '/Google Drive'),
+        folderPath: extractFolderPathFromDriveMetadata({
+          folderPath: f.folderPath ? String(f.folderPath) : undefined,
+          name: String(f.fileName || ''),
+          mimeType,
+        }),
         cacheStatus: CacheStatus.HIT,
         lastLatencyMs: latencyMs,
         contentPreview: contentStr,
@@ -76,11 +85,25 @@ export async function fetchLiveDriveFiles(
     fields
   )}&orderBy=modifiedTime desc&supportsAllDrives=true&includeItemsFromAllDrives=true`;
 
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
+  const folderQuery = encodeURIComponent(
+    "trashed = false and mimeType = 'application/vnd.google-apps.folder'"
+  );
+  const folderUrl = `https://www.googleapis.com/drive/v3/files?pageSize=100&q=${folderQuery}&fields=${encodeURIComponent(
+    'files(id,name,parents)'
+  )}&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+
+  const [response, folderRes] = await Promise.all([
+    fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    }),
+    fetch(folderUrl, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    }).catch(() => null),
+  ]);
 
   if (!response.ok) {
     let errDetail = `HTTP ${response.status}`;
@@ -91,6 +114,25 @@ export async function fetchLiveDriveFiles(
       errDetail = await response.text();
     }
     throw new Error(`Google Drive API error (${response.status}): ${errDetail}`);
+  }
+
+  const folderMap: Record<string, DriveFolderLookupEntry> = {};
+  if (folderRes && folderRes.ok) {
+    try {
+      const folderData = await folderRes.json();
+      for (const fld of folderData.files || []) {
+        const fldId = String(fld.id || '');
+        if (!fldId) continue;
+        const parentIds = Array.isArray(fld.parents) ? fld.parents.map(String) : [];
+        folderMap[fldId] = {
+          id: fldId,
+          name: String(fld.name || 'Folder'),
+          parentId: parentIds[0],
+        };
+      }
+    } catch {
+      // Ignore optional folder map resolution errors
+    }
   }
 
   const data = await response.json();
@@ -106,6 +148,7 @@ export async function fetchLiveDriveFiles(
     const thumbnailLink = f.thumbnailLink ? String(f.thumbnailLink) : undefined;
     const webContentLink = f.webContentLink ? String(f.webContentLink) : undefined;
     const highResThumb = upgradeDriveThumbnailUrl(thumbnailLink);
+    const parents = Array.isArray(f.parents) ? f.parents.map(String) : undefined;
 
     return {
       id,
@@ -118,7 +161,12 @@ export async function fetchLiveDriveFiles(
       webContentLink,
       thumbnailLink,
       mediaUrl: highResThumb,
-      folderPath: '/Google Drive',
+      folderPath: extractFolderPathFromDriveMetadata({
+        name,
+        mimeType,
+        parents,
+        folderMap,
+      }),
       cacheStatus: CacheStatus.MISS,
       lastLatencyMs: latencyMs,
       contentPreview: '',
@@ -333,15 +381,21 @@ export async function importDriveFileByUrlOrId(urlOrId: string): Promise<{
   const content = String(data.content || '');
   const size = Number(data.size || new TextEncoder().encode(content).byteLength);
 
+  const itemName = String(data.name || `drive-${parsed.fileId.slice(0, 8)}.txt`);
+  const itemMime = String(data.mimeType || 'text/plain');
   const item: DriveItem = {
     id: String(data.id || parsed.fileId),
-    name: String(data.name || `drive-${parsed.fileId.slice(0, 8)}.txt`),
-    mimeType: String(data.mimeType || 'text/plain'),
+    name: itemName,
+    mimeType: itemMime,
     size,
     modifiedTime: String(data.modifiedTime || new Date().toISOString()),
     md5Checksum: String(data.md5Checksum || computeFastChecksum(content)),
     webViewLink: data.webViewLink ? String(data.webViewLink) : undefined,
-    folderPath: '/Google Drive',
+    folderPath: extractFolderPathFromDriveMetadata({
+      folderPath: data.folderPath ? String(data.folderPath) : undefined,
+      name: itemName,
+      mimeType: itemMime,
+    }),
     cacheStatus: CacheStatus.HIT,
     lastLatencyMs: latencyMs,
     contentPreview: content,
@@ -365,6 +419,15 @@ export async function uploadFileToDrive(params: {
   const byteSize = new TextEncoder().encode(params.content).byteLength;
   const checksum = computeFastChecksum(params.content);
 
+  const resolvedFolderPath =
+    params.folderPath && params.folderPath.trim() !== '/Google Drive'
+      ? normalizeFolderPath(params.folderPath)
+      : extractFolderPathFromDriveMetadata({
+          folderPath: params.folderPath,
+          name: params.name,
+          mimeType: params.mimeType,
+        });
+
   if (!token) {
     const fileId = params.existingFileId || `drv-${Date.now().toString(36)}`;
     const res = await fetch('/api/mcp/rpc', {
@@ -378,7 +441,7 @@ export async function uploadFileToDrive(params: {
           fileId,
           fileName: params.name,
           mimeType: params.mimeType,
-          folderPath: params.folderPath || '/Workspace',
+          folderPath: resolvedFolderPath,
           content: params.content,
         },
       }),
@@ -394,7 +457,7 @@ export async function uploadFileToDrive(params: {
       size: byteSize,
       modifiedTime: new Date().toISOString(),
       md5Checksum: checksum,
-      folderPath: params.folderPath || '/Workspace',
+      folderPath: resolvedFolderPath,
       cacheStatus: CacheStatus.HIT,
       lastLatencyMs: latencyMs,
       contentPreview: params.content,
@@ -465,7 +528,7 @@ export async function uploadFileToDrive(params: {
     webContentLink: created.webContentLink ? String(created.webContentLink) : undefined,
     thumbnailLink,
     mediaUrl: isDataUrl ? params.content : upgradeDriveThumbnailUrl(thumbnailLink),
-    folderPath: '/Google Drive',
+    folderPath: resolvedFolderPath,
     cacheStatus: CacheStatus.HIT,
     lastLatencyMs: latencyMs,
     contentPreview: params.content,
